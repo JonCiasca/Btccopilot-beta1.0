@@ -14,7 +14,7 @@ DOMINIOS_SPOT = [
 ]
 
 DOMINIO_FUTURES = "https://fapi.binance.com"
-
+DOMINIO_BYBIT = "https://api.bybit.com" 
 
 def _proxy_get(dominios, path, params):
     """Prueba cada dominio hasta que uno responda OK. Devuelve
@@ -76,7 +76,24 @@ def open_interest():
     except Exception as e:
         return jsonify({"error": str(e)}), 502
 
-
+@app.route("/bybit/openInterest")
+def bybit_open_interest():
+    symbol = request.args.get("symbol", "BTCUSDT")
+    interval_time = request.args.get("intervalTime", "5min")
+    try:
+        r = requests.get(
+            f"{DOMINIO_BYBIT}/v5/market/open-interest",
+            params={
+                "category": "linear",
+                "symbol": symbol,
+                "intervalTime": interval_time,
+            },
+            timeout=8,
+        )
+        return jsonify(r.json()), r.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+ 
 @app.route("/")
 def home():
     return jsonify({"status": "ok", "mensaje": "Proxy de Binance funcionando"})

@@ -12,9 +12,9 @@ DOMINIOS_SPOT = [
     "https://api2.binance.com",
     "https://api3.binance.com",
 ]
-
 DOMINIO_FUTURES = "https://fapi.binance.com"
-DOMINIO_BYBIT = "https://api.bybit.com" 
+DOMINIO_BYBIT = "https://api.bybit.com"
+
 
 def _proxy_get(dominios, path, params):
     """Prueba cada dominio hasta que uno responda OK. Devuelve
@@ -49,6 +49,22 @@ def klines():
     return jsonify(body), status
 
 
+@app.route("/depth")
+def depth():
+    """
+    Order book SPOT. Reusa el mismo mecanismo multi-dominio que klines/
+    ticker (Binance spot bloquea la IP de Streamlit Cloud, no la del
+    proxy). limit acepta los valores nativos de Binance: 5, 10, 20, 50,
+    100, 500, 1000, 5000 (100 default, suficiente para el heatmap).
+    """
+    params = {
+        "symbol": request.args.get("symbol", "BTCUSDT"),
+        "limit": request.args.get("limit", "100"),
+    }
+    body, status = _proxy_get(DOMINIOS_SPOT, "/api/v3/depth", params)
+    return jsonify(body), status
+
+
 @app.route("/premiumIndex")
 def premium_index():
     symbol = request.args.get("symbol", "BTCUSDT")
@@ -76,6 +92,27 @@ def open_interest():
     except Exception as e:
         return jsonify({"error": str(e)}), 502
 
+
+@app.route("/futures/depth")
+def futures_depth():
+    """
+    Order book FUTUROS (USDT-M). Mismo formato de respuesta que /depth
+    (bids/asks), pero contra fapi.binance.com. limit acepta: 5, 10, 20,
+    50, 100, 500, 1000 (100 default).
+    """
+    symbol = request.args.get("symbol", "BTCUSDT")
+    limit = request.args.get("limit", "100")
+    try:
+        r = requests.get(
+            f"{DOMINIO_FUTURES}/fapi/v1/depth",
+            params={"symbol": symbol, "limit": limit},
+            timeout=8,
+        )
+        return jsonify(r.json()), r.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
 @app.route("/bybit/openInterest")
 def bybit_open_interest():
     symbol = request.args.get("symbol", "BTCUSDT")
@@ -93,7 +130,8 @@ def bybit_open_interest():
         return jsonify(r.json()), r.status_code
     except Exception as e:
         return jsonify({"error": str(e)}), 502
- 
+
+
 @app.route("/")
 def home():
     return jsonify({"status": "ok", "mensaje": "Proxy de Binance funcionando"})

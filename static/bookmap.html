@@ -81,7 +81,7 @@
 <div id="grafico"></div>
 <div class="info">
   Precio actual (mid): <span id="precio">--</span> ·
-  Snapshots en historial: <span id="conteo">0</span>/40 ·
+  Snapshots en historial: <span id="conteo">0</span>/300 ·
   Rango cubierto: <span id="rango">--</span> ·
   Últ. actualización: <span id="ultima">--</span>
 </div>
@@ -92,7 +92,7 @@ const PROXY_HOST = window.location.host;
 
 let ws = null;
 let historial = [];              // [{ts, bids:[[precio,cant],...], asks:[...]}]
-const TOPE_HISTORIAL = 40;
+const TOPE_HISTORIAL = 300;      // ~45s de historial (300 x ~150ms) -- antes eran solo 6s, por eso se veía "congelado"
 const N_BUCKETS = 30;            // cantidad FIJA de buckets -- se auto-ajusta al rango real
 const CLAVE_CAMARA = "bookmap";  // uirevision fijo -- conserva zoom/pan entre updates
 

@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<!--
+  PROFUNDIDAD DE MERCADO EN VIVO — Bookmap 2D/3D (v2)
+  ------------------------------------------------------
+  Se sirve directo desde el proxy Flask en /bookmap -- por eso NO
+  hace falta configurar ningún host a mano, se detecta solo
+  (window.location.host), porque este archivo vive en el MISMO
+  dominio que el WebSocket.
+
+  FIX v2 sobre la primera versión:
+    1. Rango de precio YA NO es un +-1% fijo -- se calcula del
+       precio mínimo/máximo REAL que trae el book (20 niveles de
+       profundidad cubren mucho menos que 1% del precio en BTC, por
+       eso el heatmap salía casi vacío). Ahora el rango SIEMPRE
+       coincide con lo que el book realmente reporta.
+    2. Cantidad de buckets FIJA (30) en vez de ancho fijo en USD --
+       así se auto-ajusta solo entre spot y futures, sin importar el
+       tick size de cada uno.
+-->
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Profundidad de Mercado en Vivo — Bookmap</title>
+<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+<style>
+  body {
+    background: #0e1117;
+    color: #e5e5e5;
+    font-family: 'Consolas', monospace;
+    padding: 20px;
+    margin: 0;
+  }
+  h2 { color: #ff8c00; margin-top: 0; }
+  .controles {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+  }
+  select, button {
+    background: #1e2128;
+    color: #e5e5e5;
+    border: 1px solid #3a3a3a;
+    border-radius: 4px;
+    padding: 6px 14px;
+    font-family: inherit;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  button.activo { border-color: #ff8c00; color: #ff8c00; }
+  button:hover { background: #2a2e37; }
+  #estado { font-weight: bold; }
+  .ok { color: #22c55e; }
+  .bad { color: #ef4444; }
+  .wait { color: #eab308; }
+  #grafico { width: 100%; height: 640px; }
+  .info { color: #9aa0a6; font-size: 12px; margin-top: 6px; }
+</style>
+</head>
+<body>
+
+<h2>🌊 Profundidad de Mercado en Vivo</h2>
+
+<div class="controles">
+  Mercado:
+  <select id="mercado">
+    <option value="spot">Spot</option>
+    <option value="futures">Futures</option>
+  </select>
+  <button onclick="conectar()">Conectar</button>
+  <button onclick="desconectar()">Desconectar</button>
+  <span style="width:1px;height:20px;background:#3a3a3a;"></span>
+  Vista:
+  <button id="btn2d" class="activo" onclick="cambiarVista('2d')">📊 Heatmap 2D</button>
+  <button id="btn3d" onclick="cambiarVista('3d')">🧊 Superficie 3D</button>
+  <span style="width:1px;height:20px;background:#3a3a3a;"></span>
+  Estado: <span id="estado" class="wait">desconectado</span>
+</div>
+
+<div id="grafico"></div>
+<div class="info">
+  Precio actual (mid): <span id="precio">--</span> ·
+  Snapshots en historial: <span id="conteo">0</span>/40 ·
+  Rango cubierto: <span id="rango">--</span> ·
+  Últ. actualización: <span id="ultima">--</span>
+</div>
+
+<script>
+// Se detecta solo -- este archivo vive en el mismo dominio que el WS.
+const PROXY_HOST = window.location.host;
+
+let ws = null;
+let historial = [];              // [{ts, bids:[[precio,cant],...], asks:[...]}]
+const TOPE_HISTORIAL = 40;
+const N_BUCKETS = 30;            // cantidad FIJA de buckets -- se auto-ajusta al rango real
+const CLAVE_CAMARA = "bookmap";  // uirevision fijo -- conserva zoom/pan entre updates
+
+let vistaActual = "2d";
+let ultimoRender = 0;
+const INTERVALO_RENDER_MS = 1000;
+
+function setEstado(texto, clase) {
+  const el = document.getElementById('estado');
+  el.textContent = texto;
+  el.className = clase;
+}
+
+function conectar() {
+  if (ws) ws.close();
+  historial = [];
+  document.getElementById('conteo').textContent = '0';
+
+  const mercado = document.getElementById('mercado').value;
+  const protocolo = window.location.protocol === 'https:' ? 'wss' : 'ws';
+  const url = `${protocolo}://${PROXY_HOST}/ws/depth?market=${mercado}`;
+
+  setEstado('conectando...', 'wait');
+  ws = new WebSocket(url);
+
+  ws.onopen = () => setEstado('conectado ✅', 'ok');
+  ws.onclose = () => setEstado('desconectado ❌', 'bad');
+  ws.onerror = () => setEstado('error de conexión ⚠️', 'bad');
+
+  ws.onmessage = (msg) => {
+    let data;
+    try { data = JSON.parse(msg.data); } catch (e) { return; }
+    if (!data || !data.bids || !data.asks || data.bids.length === 0) return;
+
+    agregarSnapshot(data);
+    document.getElementById('conteo').textContent = historial.length;
+    document.getElementById('ultima').textContent = new Date().toLocaleTimeString();
+
+    const ahora = Date.now();
+    if (ahora - ultimoRender < INTERVALO_RENDER_MS) return; // throttle
+    ultimoRender = ahora;
+
+    renderizar();
+  };
+}
+
+function desconectar() {
+  if (ws) ws.close();
+  ws = null;
+  setEstado('desconectado (manual)', 'wait');
+}
+
+function cambiarVista(vista) {
+  vistaActual = vista;
+  document.getElementById('btn2d').classList.toggle('activo', vista === '2d');
+  document.getElementById('btn3d').classList.toggle('activo', vista === '3d');
+  renderizar();
+}
+
+// ----------------------------------
+// HISTORIAL Y MATRIZ
+// ----------------------------------
+
+function agregarSnapshot(data) {
+  const bids = data.bids.map(([p, q]) => [parseFloat(p), parseFloat(q)]).slice(0, 40);
+  const asks = data.asks.map(([p, q]) => [parseFloat(p), parseFloat(q)]).slice(0, 40);
+  historial.push({ ts: data.ts, bids, asks });
+  if (historial.length > TOPE_HISTORIAL) historial.shift();
+}
+
+function precioActualDe(snap) {
+  if (!snap.bids.length || !snap.asks.length) return null;
+  return (snap.bids[0][0] + snap.asks[0][0]) / 2;
+}
+
+/**
+ * FIX PRINCIPAL: en vez de +-1% inventado, el rango de precio se saca
+ * de los precios MÍNIMO y MÁXIMO que realmente trae el book en todo
+ * el historial guardado, con un colchón chico (10%) para que no quede
+ * todo pegado al borde. Así el heatmap SIEMPRE tiene datos visibles,
+ * sin importar cuán angosto o ancho sea el book real en ese momento.
+ */
+function rangoPrecioReal() {
+  let min = Infinity, max = -Infinity;
+  historial.forEach(snap => {
+    snap.bids.forEach(([p]) => { if (p < min) min = p; if (p > max) max = p; });
+    snap.asks.forEach(([p]) => { if (p < min) min = p; if (p > max) max = p; });
+  });
+  if (!isFinite(min) || !isFinite(max) || min === max) return null;
+  const colchon = (max - min) * 0.1;
+  return { min: min - colchon, max: max + colchon };
+}
+
+function construirMatriz() {
+  if (historial.length === 0) return null;
+
+  const rango = rangoPrecioReal();
+  if (!rango) return null;
+  const { min: precioMin, max: precioMax } = rango;
+
+  const buckets = [];
+  for (let i = 0; i < N_BUCKETS; i++) {
+    buckets.push(precioMin + ((precioMax - precioMin) * i) / (N_BUCKETS - 1));
+  }
+
+  const matriz = Array.from({ length: N_BUCKETS }, () => new Array(historial.length).fill(0));
+
+  historial.forEach((snap, j) => {
+    snap.bids.forEach(([precio, cantidad]) => {
+      const idx = Math.min(Math.max(Math.floor(((precio - precioMin) / (precioMax - precioMin)) * N_BUCKETS), 0), N_BUCKETS - 1);
+      matriz[idx][j] += cantidad;
+    });
+    snap.asks.forEach(([precio, cantidad]) => {
+      const idx = Math.min(Math.max(Math.floor(((precio - precioMin) / (precioMax - precioMin)) * N_BUCKETS), 0), N_BUCKETS - 1);
+      matriz[idx][j] -= cantidad;
+    });
+  });
+
+  const ultimo = historial[historial.length - 1];
+  const precioActual = precioActualDe(ultimo) || (precioMin + precioMax) / 2;
+
+  return { buckets, matriz, precioActual, precioMin, precioMax };
+}
+
+// ----------------------------------
+// RENDER
+// ----------------------------------
+
+const COLORSCALE = [[0.0, "#ef4444"], [0.5, "#12151c"], [1.0, "#22c55e"]];
+
+function renderizar() {
+  const resultado = construirMatriz();
+  if (!resultado) return;
+
+  const { buckets, matriz, precioActual, precioMin, precioMax } = resultado;
+  document.getElementById('precio').textContent = `$${precioActual.toFixed(2)}`;
+  document.getElementById('rango').textContent = `$${precioMin.toFixed(0)} - $${precioMax.toFixed(0)}`;
+
+  const div = document.getElementById('grafico');
+  const xVals = historial.map((_, i) => i);
+
+  if (vistaActual === '2d') {
+    const data = [{
+      type: 'heatmap',
+      z: matriz,
+      x: xVals,
+      y: buckets,
+      colorscale: COLORSCALE,
+      zmid: 0,
+      colorbar: { title: 'ask ⟵ ⟶ bid' },
+      hovertemplate: 'precio: $%{y:,.2f}<br>tamaño neto: %{z:.4f}<extra></extra>',
+    }];
+    const layout = {
+      uirevision: CLAVE_CAMARA,
+      template: 'plotly_dark',
+      paper_bgcolor: '#0e1117',
+      plot_bgcolor: '#0e1117',
+      xaxis: { title: 'snapshots recientes →' },
+      yaxis: { title: 'precio (USD)' },
+      shapes: [{
+        type: 'line', x0: 0, x1: xVals.length - 1,
+        y0: precioActual, y1: precioActual,
+        line: { color: '#ff8c00', dash: 'dot', width: 1 },
+      }],
+      margin: { l: 70, r: 20, t: 20, b: 40 },
+    };
+    Plotly.react(div, data, layout, { responsive: true });
+  } else {
+    const data = [{
+      type: 'surface',
+      z: matriz,
+      x: xVals,
+      y: buckets,
+      colorscale: COLORSCALE,
+      cmid: 0,
+      contours: { z: { show: true, usecolormap: true, project_z: true } },
+      showscale: false,
+    }];
+    const layout = {
+      uirevision: CLAVE_CAMARA,
+      template: 'plotly_dark',
+      paper_bgcolor: '#0e1117',
+      scene: {
+        xaxis: { title: 'snapshots →' },
+        yaxis: { title: 'precio (USD)' },
+        zaxis: { title: 'tamaño (ask ⟵ ⟶ bid)' },
+        bgcolor: '#0e1117',
+        camera: { eye: { x: 1.6, y: -1.6, z: 0.9 } },
+      },
+      margin: { l: 0, r: 0, t: 20, b: 0 },
+    };
+    Plotly.react(div, data, layout, { responsive: true });
+  }
+}
+</script>
+
+</body>
+</html>

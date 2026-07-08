@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_sock import Sock
 import requests
 import time
@@ -174,7 +174,21 @@ def home():
         "status": "ok",
         "mensaje": "Proxy de Binance funcionando",
         "websocket": "/ws/depth?market=spot|futures",
+        "bookmap": "/bookmap",
     })
+
+
+@app.route("/bookmap")
+def bookmap():
+    """
+    Sirve el HTML del bookmap en vivo desde el mismo proxy -- así no
+    hace falta un hosting nuevo ni aprender otra plataforma. El
+    archivo vive en la carpeta static/ de este mismo repo (ver
+    instrucciones de despliegue). Al servirse desde este mismo
+    dominio, el HTML detecta el host solo (window.location.host) --
+    no hace falta editar ninguna URL a mano.
+    """
+    return send_from_directory("static", "bookmap.html")
 
 
 # ============================================================

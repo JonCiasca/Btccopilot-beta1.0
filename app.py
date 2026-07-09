@@ -11,7 +11,7 @@ app = Flask(__name__)
 sock = Sock(app)
 
 # ----------------------------------
-# CACHE TTL GENERALIZADO (todos los endpoints REST a Binance).
+# CACHE TTL GENERALIZADO (todos los endpoints REST a Binance)
 # ----------------------------------
 # ANTES: solo /depth y /futures/depth tenían cache. klines (pedido 4
 # VECES por refresh desde main.py: 5m, 15m, 1h + timeframe operativo)
@@ -301,13 +301,16 @@ def bybit_open_interest():
 
 @app.route("/")
 def home():
+    ahora = time.time()
     return jsonify({
         "status": "ok",
         "mensaje": "Proxy de Binance funcionando",
         "websocket": "/ws/depth?market=spot|futures",
         "bookmap": "/bookmap",
         "ban_spot_activo": _grupo_baneado("spot"),
+        "ban_spot_restante_segundos": max(0, int(_BAN_HASTA["spot"] - ahora)),
         "ban_futures_activo": _grupo_baneado("futures"),
+        "ban_futures_restante_segundos": max(0, int(_BAN_HASTA["futures"] - ahora)),
     })
 
 

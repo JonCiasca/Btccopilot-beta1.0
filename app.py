@@ -1,14 +1,10 @@
-from flask import Flask, request, jsonify, send_from_directory
-from flask_sock import Sock
+from flask import Flask, request, jsonify
 import requests
 import time
 import threading
-import json
 import re
-import websocket  # librería websocket-client
 
 app = Flask(__name__)
-sock = Sock(app)
 
 # ----------------------------------
 # CACHE TTL GENERALIZADO (todos los endpoints REST a Binance)
@@ -198,28 +194,6 @@ def klines():
     return jsonify(body), status
 
 
-@app.route("/depth")
-def depth():
-    """
-    Order book SPOT vía REST (snapshot, no vivo). Para book EN VIVO
-    real, ver /ws/depth más abajo.
-    """
-    if _grupo_baneado("spot"):
-        body, status = _respuesta_ban_activo("spot")
-        return jsonify(body), status
-
-    symbol = request.args.get("symbol", "BTCUSDT")
-    limit = min(int(request.args.get("limit", "20")), 50)
-    cache_key = f"depth_spot:{symbol}:{limit}"
-
-    body, status = _get_con_cache(
-        cache_key,
-        lambda: _proxy_get(DOMINIOS_SPOT, "/api/v3/depth", {"symbol": symbol, "limit": limit}, grupo="spot"),
-        ttl_segundos=TTL_RAPIDO,
-    )
-    return jsonify(body), status
-
-
 @app.route("/premiumIndex")
 def premium_index():
     if _grupo_baneado("futures"):
@@ -254,30 +228,6 @@ def open_interest():
     return jsonify(body), status
 
 
-@app.route("/futures/depth")
-def futures_depth():
-    """
-    Order book FUTUROS (USDT-M) vía REST (snapshot). Para book en
-    vivo, ver /ws/depth.
-    """
-    if _grupo_baneado("futures"):
-        body, status = _respuesta_ban_activo("futures")
-        return jsonify(body), status
-
-    symbol = request.args.get("symbol", "BTCUSDT")
-    limit = min(int(request.args.get("limit", "20")), 50)
-    cache_key = f"depth_futures:{symbol}:{limit}"
-
-    body, status = _get_con_cache(
-        cache_key,
-        lambda: _proxy_get_simple(
-            f"{DOMINIO_FUTURES}/fapi/v1/depth", {"symbol": symbol, "limit": limit}, grupo="futures"
-        ),
-        ttl_segundos=TTL_RAPIDO,
-    )
-    return jsonify(body), status
-
-
 @app.route("/bybit/openInterest")
 def bybit_open_interest():
     # Bybit tiene su propio sistema de rate-limit, independiente del
@@ -305,156 +255,11 @@ def home():
     return jsonify({
         "status": "ok",
         "mensaje": "Proxy de Binance funcionando",
-        "websocket": "/ws/depth?market=spot|futures",
-        "bookmap": "/bookmap",
         "ban_spot_activo": _grupo_baneado("spot"),
         "ban_spot_restante_segundos": max(0, int(_BAN_HASTA["spot"] - ahora)),
         "ban_futures_activo": _grupo_baneado("futures"),
         "ban_futures_restante_segundos": max(0, int(_BAN_HASTA["futures"] - ahora)),
     })
-
-
-@app.route("/bookmap")
-def bookmap():
-    """
-    Sirve el HTML del bookmap en vivo desde el mismo proxy -- así no
-    hace falta un hosting nuevo ni aprender otra plataforma. El
-    archivo vive en la carpeta static/ de este mismo repo (ver
-    instrucciones de despliegue). Al servirse desde este mismo
-    dominio, el HTML detecta el host solo (window.location.host) --
-    no hace falta editar ninguna URL a mano.
-    """
-    return send_from_directory("static", "bookmap.html")
-
-
-# ============================================================
-# WEBSOCKET RELAY — order book EN VIVO (sub-segundo, no REST)
-# ============================================================
-#
-# Objetivo: reemplazar el polling REST de /depth y /futures/depth
-# para quien necesite book en vivo real, sin gastar weight de Binance
-# ni arriesgar bans -1003. Los endpoints REST de arriba NO se tocan,
-# siguen funcionando igual para quien ya los consume (ej. Streamlit).
-#
-# ARQUITECTURA:
-#   1. Un hilo en background por mercado (spot, futures) mantiene UNA
-#      conexión persistente al "partial book depth stream" de Binance
-#      -- Binance empuja los primeros 20 niveles de cada lado cada
-#      ~100ms, sin que el proxy tenga que pedir nada.
-#   2. Cada mensaje que llega se guarda como "último estado conocido"
-#      en memoria, normalizado al mismo formato bids/asks que ya usan
-#      /depth y /futures/depth -- así el frontend no distingue si el
-#      dato vino de REST o de WS.
-#   3. Cualquier cliente (frontend JS, bookmap 3D) que se conecta a
-#      /ws/depth recibe ese estado en un loop -- sin pedir nada, sin
-#      rate-limit de su lado. Esto SOLUCIONA el techo real que tenías
-#      con REST (Binance banea -1003 si pedís muy seguido); acá el
-#      proxy pide UNA sola vez y reparte a cuantos clientes hagan falta.
-#
-# LÍMITE HONESTO: esto es "partial depth" (foto de los primeros 20
-# niveles, no el book completo con miles de niveles vía diff+
-# reconciliación de secuencia). Para lectura visual -- heatmap,
-# bookmap 3D -- alcanza y sobra; el diff-depth completo solo aporta
-# algo si necesitás reconstruir el book ENTERO, que no es el caso.
-#
-# NOTA: el WebSocket relay NO pasa por _BAN_HASTA porque es un stream
-# push persistente, no polling -- Binance no lo cuenta contra el
-# weight de peticiones REST. Si en algún momento migrás klines/ticker
-# a un stream también (kline@interval, por ejemplo), ahí sí conviene
-# unificar el criterio.
-
-_ULTIMO_BOOK = {
-    "spot": None,
-    "futures": None,
-}
-_LOCK = threading.Lock()
-
-URLS_WS_BINANCE = {
-    "spot": "wss://stream.binance.com:9443/ws/btcusdt@depth20@100ms",
-    "futures": "wss://fstream.binance.com/ws/btcusdt@depth20@100ms",
-}
-
-
-def _normalizar_mensaje(data):
-    """
-    Normaliza el mensaje crudo de Binance (spot o futures, con
-    nombres de clave levemente distintos) al mismo formato que ya
-    devuelven /depth y /futures/depth: {"bids": [...], "asks": [...]}.
-    """
-    bids = data.get("bids") or data.get("b") or []
-    asks = data.get("asks") or data.get("a") or []
-    return {
-        "bids": bids,
-        "asks": asks,
-        "ts": int(time.time() * 1000),
-    }
-
-
-def _hilo_binance_ws(mercado):
-    """
-    Mantiene la conexión persistente a Binance para un mercado dado.
-    Si se corta (red, restart del lado de Binance, deploy de Render,
-    etc.), espera 3s y reconecta sola -- el hilo nunca muere en
-    silencio, así que /ws/depth siempre tiene la mejor data disponible
-    apenas la conexión vuelve.
-    """
-    url = URLS_WS_BINANCE[mercado]
-
-    def _on_message(ws_conn, mensaje):
-        try:
-            data = json.loads(mensaje)
-        except Exception:
-            return
-        normalizado = _normalizar_mensaje(data)
-        with _LOCK:
-            _ULTIMO_BOOK[mercado] = normalizado
-
-    while True:
-        try:
-            wsapp = websocket.WebSocketApp(url, on_message=_on_message)
-            wsapp.run_forever(ping_interval=20, ping_timeout=10)
-        except Exception:
-            pass
-        time.sleep(3)  # pausa antes de reconectar -- evita loop agresivo si Binance está caído
-
-
-def _iniciar_hilos_binance():
-    for mercado in URLS_WS_BINANCE:
-        hilo = threading.Thread(target=_hilo_binance_ws, args=(mercado,), daemon=True)
-        hilo.start()
-
-
-_iniciar_hilos_binance()
-
-
-@sock.route("/ws/depth")
-def ws_depth(ws):
-    """
-    Endpoint WebSocket para clientes externos (frontend JS, bookmap
-    3D, o cualquier tercero autorizado).
-
-    Uso: wss://<tu-proxy>.onrender.com/ws/depth?market=spot
-         wss://<tu-proxy>.onrender.com/ws/depth?market=futures
-
-    Empuja el último estado conocido del book ~7 veces por segundo
-    mientras el cliente esté conectado. No hace falta que el cliente
-    pida nada ni reintente -- si Binance todavía no mandó el primer
-    mensaje, manda null hasta que llegue (arranque en frío del proxy).
-    """
-    mercado = request.args.get("market", "spot")
-    if mercado not in _ULTIMO_BOOK:
-        mercado = "spot"
-
-    try:
-        while True:
-            with _LOCK:
-                estado = _ULTIMO_BOOK[mercado]
-            ws.send(json.dumps(estado))
-            time.sleep(0.15)
-    except Exception:
-        # El cliente se desconectó (cerró pestaña, perdió red, etc.)
-        # -- no es un error del servidor, solo termina esta conexión.
-        return
 
 
 if __name__ == "__main__":

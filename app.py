@@ -3,6 +3,8 @@ import requests
 import time
 import threading
 import re
+import json
+import os
 
 app = Flask(__name__)
 
@@ -66,7 +68,35 @@ def _get_con_cache(cache_key, fetch_fn, ttl_segundos=TTL_RAPIDO):
 # spot (ticker/klines/depth, comparten el mismo bucket de peso de la
 # API spot) y futures (premiumIndex/openInterest/futures-depth, bucket
 # separado) tienen límites independientes en Binance.
-_BAN_HASTA = {"spot": 0, "futures": 0}
+#
+# PERSISTENCIA EN DISCO: Render reinicia el proceso (redeploy, sleep
+# por inactividad, crash) y eso borraba _BAN_HASTA de memoria. Al
+# volver, el circuit breaker "olvidaba" el ban y dejaba pasar un
+# request nuevo a Binance mientras la IP seguía baneada del otro lado
+# -- eso es lo que hacía que el contador a veces SUBIERA en vez de
+# bajar (Binance extiende el castigo si sigue recibiendo tráfico de
+# una IP ya bloqueada). Ahora el estado se guarda en un archivo y se
+# relee en cada chequeo, así sobrevive a los reinicios del dyno.
+_BAN_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ban_state.json")
+_BAN_LOCK = threading.Lock()
+
+
+def _leer_ban_state():
+    try:
+        with open(_BAN_STATE_PATH, "r") as f:
+            data = json.load(f)
+            return {"spot": float(data.get("spot", 0)), "futures": float(data.get("futures", 0))}
+    except Exception:
+        return {"spot": 0, "futures": 0}
+
+
+def _escribir_ban_state(estado):
+    try:
+        with open(_BAN_STATE_PATH, "w") as f:
+            json.dump(estado, f)
+    except Exception:
+        pass  # si falla escribir a disco, seguimos con lo que haya en memoria de esta request
+
 
 _PATRON_BAN_TS = re.compile(r"banned until (\d+)")
 
@@ -74,10 +104,10 @@ _PATRON_BAN_TS = re.compile(r"banned until (\d+)")
 def _registrar_si_es_ban(grupo, body):
     """
     Si body es un error -1003 de Binance, extrae el timestamp de
-    "banned until X" y lo guarda en _BAN_HASTA[grupo]. Si no matchea
-    el patrón esperado (formato de mensaje cambia), usa un fallback de
-    60s desde ahora -- mejor un enfriamiento conservador que seguir
-    pegándole a ciegas.
+    "banned until X" y lo guarda en disco. Si no matchea el patrón
+    esperado (formato de mensaje cambia), usa un fallback de 60s desde
+    ahora -- mejor un enfriamiento conservador que seguir pegándole a
+    ciegas.
     """
     if not isinstance(body, dict) or body.get("code") != -1003:
         return
@@ -85,18 +115,23 @@ def _registrar_si_es_ban(grupo, body):
     msg = body.get("msg", "")
     match = _PATRON_BAN_TS.search(msg)
 
-    if match:
-        _BAN_HASTA[grupo] = int(match.group(1)) / 1000.0  # ms -> s
-    else:
-        _BAN_HASTA[grupo] = time.time() + 60
+    with _BAN_LOCK:
+        estado = _leer_ban_state()
+        if match:
+            estado[grupo] = int(match.group(1)) / 1000.0  # ms -> s
+        else:
+            estado[grupo] = time.time() + 60
+        _escribir_ban_state(estado)
 
 
 def _grupo_baneado(grupo):
-    return time.time() < _BAN_HASTA[grupo]
+    estado = _leer_ban_state()
+    return time.time() < estado[grupo]
 
 
 def _respuesta_ban_activo(grupo):
-    restante = max(0, int(_BAN_HASTA[grupo] - time.time()))
+    estado = _leer_ban_state()
+    restante = max(0, int(estado[grupo] - time.time()))
     return {
         "error": (
             f"IP baneada temporalmente por Binance (peso excedido, grupo '{grupo}'). "
@@ -252,13 +287,14 @@ def bybit_open_interest():
 @app.route("/")
 def home():
     ahora = time.time()
+    estado = _leer_ban_state()
     return jsonify({
         "status": "ok",
         "mensaje": "Proxy de Binance funcionando",
         "ban_spot_activo": _grupo_baneado("spot"),
-        "ban_spot_restante_segundos": max(0, int(_BAN_HASTA["spot"] - ahora)),
+        "ban_spot_restante_segundos": max(0, int(estado["spot"] - ahora)),
         "ban_futures_activo": _grupo_baneado("futures"),
-        "ban_futures_restante_segundos": max(0, int(_BAN_HASTA["futures"] - ahora)),
+        "ban_futures_restante_segundos": max(0, int(estado["futures"] - ahora)),
     })
 
 

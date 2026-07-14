@@ -185,7 +185,12 @@ def _proxy_get_simple(url, params, grupo="futures"):
 # loops en Python puro son perfectamente aceptables en performance.
 
 INTERVALO_PREDICCION_HORAS = 5  # ~4-5 tesis por día
-MAX_PREDICCIONES_GUARDADAS = 12  # ~2.5 días de historial
+INTERVALO_REINTENTO_MINUTOS = 10  # si un ciclo falla (ban activo, timeout en frío al
+                                    # despertar del sleep de Render, etc.), reintentar
+                                    # pronto -- NO esperar las 5hs completas del
+                                    # intervalo normal, o un fallo nocturno te deja sin
+                                    # tesis toda la mañana siguiente.
+MAX_PREDICCIONES_GUARDADAS = 14  # ~2.9 días de historial (deja margen sobre las 7 que se muestran)
 RUTA_PREDICCIONES = "predicciones.json"
 
 _PREDICCIONES = []
@@ -360,23 +365,149 @@ def _tendencia_sma(velas, periodo=20):
     return "neutral"
 
 
+def _evaluar_resultado_prediccion(pred, velas_ventana):
+    """
+    Recorre CRONOLÓGICAMENTE las velas transcurridas desde la emisión de
+    una tesis hasta ahora, y determina qué pasó primero: ¿tocó las
+    etapas proyectadas en orden, o tocó la invalidación antes? Esto es
+    lo que le da sentido real al % (no es "el precio llegó cerca en
+    algún momento", es "en qué orden ocurrieron las cosas").
+
+    Devuelve dict: {acierto_pct, estado, etapas_alcanzadas, etapas_total, invalidada}
+    """
+    sesgo = pred.get("sesgo")
+    etapas = pred.get("etapas", [])
+    invalidacion = pred.get("invalidacion")
+    precio_emision = pred.get("precio_emision")
+
+    if sesgo == "neutral" or not etapas or precio_emision is None or not velas_ventana:
+        return {
+            "acierto_pct": None, "estado": "sin_direccion", "invalidada": False,
+            "etapas_alcanzadas": 0, "etapas_total": len(etapas),
+        }
+
+    # Etapas en orden de cercanía (alcista: ascendente: bajista: descendente)
+    niveles_ordenados = sorted([e["nivel"] for e in etapas], reverse=(sesgo == "bajista"))
+
+    invalidada = False
+    idx_etapa = 0
+
+    for vela in velas_ventana:
+        high, low = float(vela[2]), float(vela[3])
+
+        if invalidacion is not None:
+            if sesgo == "alcista" and low <= invalidacion:
+                invalidada = True
+                break
+            if sesgo == "bajista" and high >= invalidacion:
+                invalidada = True
+                break
+
+        while idx_etapa < len(niveles_ordenados):
+            nivel = niveles_ordenados[idx_etapa]
+            tocado = (sesgo == "alcista" and high >= nivel) or (sesgo == "bajista" and low <= nivel)
+            if tocado:
+                idx_etapa += 1
+            else:
+                break
+
+    etapas_alcanzadas = idx_etapa
+    etapas_total = len(niveles_ordenados)
+
+    if invalidada:
+        # Crédito parcial reducido: si alcanzó algo antes de invalidarse,
+        # no es lo mismo que invalidarse en la primera vela.
+        acierto_pct = round((etapas_alcanzadas / etapas_total) * 100 * 0.3) if etapas_total else 0
+        estado = "invalidada"
+    elif etapas_total > 0 and etapas_alcanzadas == etapas_total:
+        acierto_pct = 100
+        estado = "cumplida"
+    elif etapas_alcanzadas > 0:
+        acierto_pct = round((etapas_alcanzadas / etapas_total) * 100)
+        estado = "parcial"
+    else:
+        # Todavía no tocó nada ni se invalidó: % de avance proporcional
+        # a la distancia recorrida hacia la primera etapa proyectada.
+        primera_etapa = niveles_ordenados[0]
+        distancia_total = abs(primera_etapa - precio_emision)
+        precio_final_ventana = float(velas_ventana[-1][4])
+        avance = (
+            (precio_final_ventana - precio_emision) if sesgo == "alcista"
+            else (precio_emision - precio_final_ventana)
+        )
+        progreso = max(0.0, min(avance / distancia_total, 1.0)) if distancia_total > 0 else 0.0
+        acierto_pct = round(progreso * 100)
+        estado = "en_curso"
+
+    return {
+        "acierto_pct": acierto_pct,
+        "estado": estado,
+        "invalidada": invalidada,
+        "etapas_alcanzadas": etapas_alcanzadas,
+        "etapas_total": etapas_total,
+    }
+
+
+def _sellar_predicciones_pendientes_sin_lock(velas_completas, ahora):
+    """
+    ASUME que _PREDICCIONES_LOCK ya está tomado por quien llama (ver uso
+    en _hilo_generador_predicciones) -- threading.Lock no es reentrante,
+    así que esta función NO toma el lock por su cuenta.
+
+    Recorre las predicciones guardadas que todavía no tienen "resultado"
+    y, para cada una, arma la ventana de velas desde su ts_emision hasta
+    ahora y la sella con _evaluar_resultado_prediccion. Una vez sellada
+    (resultado != None) queda FIJA para siempre -- no se vuelve a
+    recalcular en ciclos futuros, es una foto de lo que pasó durante esa
+    tesis, no una métrica que se mueve con el tiempo.
+    """
+    if not velas_completas:
+        return
+
+    for p in _PREDICCIONES:
+        if p.get("resultado") is not None:
+            continue
+        try:
+            ts_emision = datetime.fromisoformat(p["ts_emision"])
+        except Exception:
+            continue
+
+        velas_ventana = [
+            v for v in velas_completas
+            if datetime.fromtimestamp(v[0] / 1000, tz=timezone.utc) >= ts_emision
+        ]
+        if len(velas_ventana) < 2:
+            continue  # todavía no pasó tiempo suficiente como para evaluar nada
+
+        p["resultado"] = _evaluar_resultado_prediccion(p, velas_ventana)
+        p["resultado"]["sellado_ts"] = ahora.isoformat()
+
+
 def _generar_prediccion():
     """
-    Arma UNA tesis de mercado completa. Devuelve None si falta algún
-    dato crítico (velas o ban activo) -- mejor no emitir nada a emitir
-    una tesis fabricada con datos incompletos.
+    Arma UNA tesis de mercado completa. Devuelve (None, None) si falta
+    algún dato crítico (velas o ban activo) -- mejor no emitir nada a
+    emitir una tesis fabricada con datos incompletos.
+
+    Devuelve (pred_dict, velas_completas): velas_completas es la lista
+    cruda de klines (limit=400, ~100hs) que además de usarse acá para
+    tendencia/swing de corto plazo, se reutiliza afuera (en el hilo)
+    para SELLAR con % de acierto las tesis anteriores -- así no hace
+    falta un segundo pedido a Binance solo para eso.
     """
     if _grupo_baneado("spot") or _grupo_baneado("futures"):
-        return None
+        return None, None
 
     ahora = datetime.now(timezone.utc)
 
-    velas, status = _proxy_get(
+    velas_completas, status = _proxy_get(
         DOMINIOS_SPOT, "/api/v3/klines",
-        {"symbol": "BTCUSDT", "interval": "15m", "limit": 100}, grupo="spot",
+        {"symbol": "BTCUSDT", "interval": "15m", "limit": 400}, grupo="spot",
     )
-    if not isinstance(velas, list) or len(velas) < 30:
-        return None
+    if not isinstance(velas_completas, list) or len(velas_completas) < 30:
+        return None, None
+
+    velas = velas_completas[-100:]  # ventana corta para tendencia/swing, mismo criterio que antes
 
     precio_actual = float(velas[-1][4])
     soportes, resistencias = _swing_niveles(velas)
@@ -504,7 +635,8 @@ def _generar_prediccion():
         "invalidacion": invalidacion,
         "invalidacion_fuente": invalidacion_fuente,
         "resumen": resumen,
-    }
+        "resultado": None,  # se sella más adelante, cuando se emita la próxima tesis
+    }, velas_completas
 
 
 def _cargar_predicciones_disco():
@@ -544,16 +676,25 @@ def _hilo_generador_predicciones():
 
     while True:
         try:
-            pred = _generar_prediccion()
+            pred, velas_completas = _generar_prediccion()
             if pred:
+                ahora_ciclo = datetime.now(timezone.utc)
                 with _PREDICCIONES_LOCK:
+                    _sellar_predicciones_pendientes_sin_lock(velas_completas, ahora_ciclo)
                     _PREDICCIONES.insert(0, pred)
                     _PREDICCIONES = _PREDICCIONES[:MAX_PREDICCIONES_GUARDADAS]
                     _guardar_predicciones_disco(_PREDICCIONES)
+                time.sleep(INTERVALO_PREDICCION_HORAS * 3600)
+            else:
+                # Ciclo sin datos suficientes (ban activo, velas insuficientes,
+                # Deribit caído, etc.) -- reintentar pronto, no esperar el
+                # intervalo completo. Esto es lo que evita quedarse sin ninguna
+                # tesis nueva por horas si el primer intento del día falla.
+                print("[predicciones] ciclo sin datos suficientes, reintento en unos minutos")
+                time.sleep(INTERVALO_REINTENTO_MINUTOS * 60)
         except Exception as e:
             print(f"[predicciones] error generando tesis: {e}")
-
-        time.sleep(INTERVALO_PREDICCION_HORAS * 3600)
+            time.sleep(INTERVALO_REINTENTO_MINUTOS * 60)
 
 
 threading.Thread(target=_hilo_generador_predicciones, daemon=True).start()

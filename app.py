@@ -790,6 +790,33 @@ def predicciones():
     })
 
 
+@app.route("/predicciones/generar", methods=["POST"])
+def generar_prediccion_manual():
+    """
+    Disparo MANUAL: pensado para un botón en el dashboard ("Generar
+    análisis ahora"). A diferencia de _generar_si_corresponde (que solo
+    actúa si la última tesis ya venció), esto intenta generar una nueva
+    SIEMPRE que se llame -- pero sigue respetando el cooldown de 2
+    minutos y el lock compartido con el hilo de fondo (forzar=False,
+    bloquear=False), así un click accidental doble, o varias sesiones
+    tocando el botón casi al mismo tiempo, no disparan pedidos
+    simultáneos a Binance/Deribit.
+    """
+    generado = _ejecutar_ciclo_generacion(forzar=False, bloquear=False)
+
+    if generado:
+        return jsonify({"ok": True, "mensaje": "Tesis nueva generada."})
+
+    segundos_cooldown_restantes = max(0, int(120 - (time.time() - _ULTIMO_INTENTO_GENERACION)))
+
+    if segundos_cooldown_restantes > 0:
+        mensaje = f"Cooldown activo, esperá ~{segundos_cooldown_restantes}s e intentá de nuevo."
+    else:
+        mensaje = "Ya hay una generación en curso (disparada por otra sesión o por el hilo de fondo) o faltan datos del mercado este ciclo -- probá de nuevo en unos segundos."
+
+    return jsonify({"ok": False, "mensaje": mensaje}), 429
+
+
 @app.route("/ticker24hr")
 def ticker24hr():
     if _grupo_baneado("spot"):

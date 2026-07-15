@@ -184,14 +184,19 @@ def _proxy_get_simple(url, params, grupo="futures"):
 # con instrumentos de Deribit corriendo cada 5hs (no cada 15s) los
 # loops en Python puro son perfectamente aceptables en performance.
 
-INTERVALO_PREDICCION_HORAS = 4  # ~6 tesis por día
-MAX_PREDICCIONES_GUARDADAS = 7  # ~28hs de historial (7 x 4hs)
-REINTENTO_FALLO_MINUTOS = 10  # si un ciclo no logra generar tesis, reintenta rápido
-INTERVALO_CHEQUEO_MINUTOS = 15  # cada cuánto el hilo revisa autoevaluación/generación
+INTERVALO_PREDICCION_HORAS = 5  # ~4-5 tesis por día
+INTERVALO_REINTENTO_MINUTOS = 10  # si un ciclo falla (ban activo, timeout en frío al
+                                    # despertar del sleep de Render, etc.), reintentar
+                                    # pronto -- NO esperar las 5hs completas del
+                                    # intervalo normal, o un fallo nocturno te deja sin
+                                    # tesis toda la mañana siguiente.
+MAX_PREDICCIONES_GUARDADAS = 14  # ~2.9 días de historial (deja margen sobre las 7 que se muestran)
 RUTA_PREDICCIONES = "predicciones.json"
 
 _PREDICCIONES = []
 _PREDICCIONES_LOCK = threading.Lock()
+_GENERACION_LOCK = threading.Lock()  # exclusión mutua entre el hilo de fondo y el disparo on-demand
+_ULTIMO_INTENTO_GENERACION = 0  # timestamp (epoch) del último intento -- cooldown del disparo on-demand
 
 
 def _norm_pdf(x):
@@ -362,23 +367,149 @@ def _tendencia_sma(velas, periodo=20):
     return "neutral"
 
 
+def _evaluar_resultado_prediccion(pred, velas_ventana):
+    """
+    Recorre CRONOLÓGICAMENTE las velas transcurridas desde la emisión de
+    una tesis hasta ahora, y determina qué pasó primero: ¿tocó las
+    etapas proyectadas en orden, o tocó la invalidación antes? Esto es
+    lo que le da sentido real al % (no es "el precio llegó cerca en
+    algún momento", es "en qué orden ocurrieron las cosas").
+
+    Devuelve dict: {acierto_pct, estado, etapas_alcanzadas, etapas_total, invalidada}
+    """
+    sesgo = pred.get("sesgo")
+    etapas = pred.get("etapas", [])
+    invalidacion = pred.get("invalidacion")
+    precio_emision = pred.get("precio_emision")
+
+    if sesgo == "neutral" or not etapas or precio_emision is None or not velas_ventana:
+        return {
+            "acierto_pct": None, "estado": "sin_direccion", "invalidada": False,
+            "etapas_alcanzadas": 0, "etapas_total": len(etapas),
+        }
+
+    # Etapas en orden de cercanía (alcista: ascendente: bajista: descendente)
+    niveles_ordenados = sorted([e["nivel"] for e in etapas], reverse=(sesgo == "bajista"))
+
+    invalidada = False
+    idx_etapa = 0
+
+    for vela in velas_ventana:
+        high, low = float(vela[2]), float(vela[3])
+
+        if invalidacion is not None:
+            if sesgo == "alcista" and low <= invalidacion:
+                invalidada = True
+                break
+            if sesgo == "bajista" and high >= invalidacion:
+                invalidada = True
+                break
+
+        while idx_etapa < len(niveles_ordenados):
+            nivel = niveles_ordenados[idx_etapa]
+            tocado = (sesgo == "alcista" and high >= nivel) or (sesgo == "bajista" and low <= nivel)
+            if tocado:
+                idx_etapa += 1
+            else:
+                break
+
+    etapas_alcanzadas = idx_etapa
+    etapas_total = len(niveles_ordenados)
+
+    if invalidada:
+        # Crédito parcial reducido: si alcanzó algo antes de invalidarse,
+        # no es lo mismo que invalidarse en la primera vela.
+        acierto_pct = round((etapas_alcanzadas / etapas_total) * 100 * 0.3) if etapas_total else 0
+        estado = "invalidada"
+    elif etapas_total > 0 and etapas_alcanzadas == etapas_total:
+        acierto_pct = 100
+        estado = "cumplida"
+    elif etapas_alcanzadas > 0:
+        acierto_pct = round((etapas_alcanzadas / etapas_total) * 100)
+        estado = "parcial"
+    else:
+        # Todavía no tocó nada ni se invalidó: % de avance proporcional
+        # a la distancia recorrida hacia la primera etapa proyectada.
+        primera_etapa = niveles_ordenados[0]
+        distancia_total = abs(primera_etapa - precio_emision)
+        precio_final_ventana = float(velas_ventana[-1][4])
+        avance = (
+            (precio_final_ventana - precio_emision) if sesgo == "alcista"
+            else (precio_emision - precio_final_ventana)
+        )
+        progreso = max(0.0, min(avance / distancia_total, 1.0)) if distancia_total > 0 else 0.0
+        acierto_pct = round(progreso * 100)
+        estado = "en_curso"
+
+    return {
+        "acierto_pct": acierto_pct,
+        "estado": estado,
+        "invalidada": invalidada,
+        "etapas_alcanzadas": etapas_alcanzadas,
+        "etapas_total": etapas_total,
+    }
+
+
+def _sellar_predicciones_pendientes_sin_lock(velas_completas, ahora):
+    """
+    ASUME que _PREDICCIONES_LOCK ya está tomado por quien llama (ver uso
+    en _hilo_generador_predicciones) -- threading.Lock no es reentrante,
+    así que esta función NO toma el lock por su cuenta.
+
+    Recorre las predicciones guardadas que todavía no tienen "resultado"
+    y, para cada una, arma la ventana de velas desde su ts_emision hasta
+    ahora y la sella con _evaluar_resultado_prediccion. Una vez sellada
+    (resultado != None) queda FIJA para siempre -- no se vuelve a
+    recalcular en ciclos futuros, es una foto de lo que pasó durante esa
+    tesis, no una métrica que se mueve con el tiempo.
+    """
+    if not velas_completas:
+        return
+
+    for p in _PREDICCIONES:
+        if p.get("resultado") is not None:
+            continue
+        try:
+            ts_emision = datetime.fromisoformat(p["ts_emision"])
+        except Exception:
+            continue
+
+        velas_ventana = [
+            v for v in velas_completas
+            if datetime.fromtimestamp(v[0] / 1000, tz=timezone.utc) >= ts_emision
+        ]
+        if len(velas_ventana) < 2:
+            continue  # todavía no pasó tiempo suficiente como para evaluar nada
+
+        p["resultado"] = _evaluar_resultado_prediccion(p, velas_ventana)
+        p["resultado"]["sellado_ts"] = ahora.isoformat()
+
+
 def _generar_prediccion():
     """
-    Arma UNA tesis de mercado completa. Devuelve None si falta algún
-    dato crítico (velas o ban activo) -- mejor no emitir nada a emitir
-    una tesis fabricada con datos incompletos.
+    Arma UNA tesis de mercado completa. Devuelve (None, None) si falta
+    algún dato crítico (velas o ban activo) -- mejor no emitir nada a
+    emitir una tesis fabricada con datos incompletos.
+
+    Devuelve (pred_dict, velas_completas): velas_completas es la lista
+    cruda de klines (limit=400, ~100hs) que además de usarse acá para
+    tendencia/swing de corto plazo, se reutiliza afuera (en el hilo)
+    para SELLAR con % de acierto las tesis anteriores -- así no hace
+    falta un segundo pedido a Binance solo para eso.
     """
     if _grupo_baneado("spot") or _grupo_baneado("futures"):
-        return None
+        return None, None
 
     ahora = datetime.now(timezone.utc)
 
-    velas, status = _proxy_get(
+    velas_completas, status = _proxy_get(
         DOMINIOS_SPOT, "/api/v3/klines",
-        {"symbol": "BTCUSDT", "interval": "15m", "limit": 100}, grupo="spot",
+        {"symbol": "BTCUSDT", "interval": "15m", "limit": 400}, grupo="spot",
     )
-    if not isinstance(velas, list) or len(velas) < 30:
-        return None
+    if not isinstance(velas_completas, list) or len(velas_completas) < 30:
+        return None, None
+
+    velas = velas_completas[-100:]  # ventana corta para tendencia/swing, mismo criterio que antes
 
     precio_actual = float(velas[-1][4])
     soportes, resistencias = _swing_niveles(velas)
@@ -506,159 +637,8 @@ def _generar_prediccion():
         "invalidacion": invalidacion,
         "invalidacion_fuente": invalidacion_fuente,
         "resumen": resumen,
-        "evaluacion": None,  # se completa sola por _evaluar_predicciones_pendientes
-    }
-
-
-def _evaluar_prediccion(pred, precio_final, ahora):
-    """
-    Autoevaluación de UNA tesis ya emitida: compara el precio_emision
-    contra un precio_final (tomado ~INTERVALO_PREDICCION_HORAS después,
-    es decir 1 hora antes de que la tesis pase a VENCIDA -- momento en
-    que ya se puede evaluar sin esperar a que salga la próxima) y arma
-    un puntaje de VERACIDAD 0-100.
-
-    Criterio (simple y declarado, no es una ciencia exacta):
-      - Sesgo direccional (alcista/bajista): puntúa alto si el precio
-        se movió a favor de la tesis y llegó a alcanzar etapas
-        proyectadas; puntúa muy bajo si cruzó el nivel de invalidación
-        declarado en su momento.
-      - Sesgo neutral: puntúa alto si el precio se mantuvo contenido
-        (poca variación), bajo si hubo un movimiento fuerte en
-        cualquier dirección (la tesis neutral esperaba justamente eso:
-        ausencia de movimiento claro).
-
-    Devuelve dict con veracidad_pct, detalle, precio_evaluacion, ts_evaluacion.
-    """
-    sesgo = pred.get("sesgo", "neutral")
-    precio_emision = pred.get("precio_emision") or precio_final
-    etapas = pred.get("etapas", [])
-    invalidacion = pred.get("invalidacion")
-
-    cambio_pct = ((precio_final - precio_emision) / precio_emision * 100) if precio_emision else 0.0
-
-    if sesgo == "neutral":
-        if abs(cambio_pct) <= 0.4:
-            veracidad = 70
-            detalle = (
-                f"Sesgo neutral: precio se mantuvo contenido ({cambio_pct:+.2f}% desde "
-                f"la emisión) -- consistente con la falta de dirección clara detectada."
-            )
-        elif abs(cambio_pct) <= 1.0:
-            veracidad = 45
-            detalle = (
-                f"Sesgo neutral: movimiento moderado ({cambio_pct:+.2f}%) que la lectura "
-                f"neutral no anticipaba con fuerza."
-            )
-        else:
-            veracidad = 20
-            detalle = (
-                f"Sesgo neutral: el precio se movió con fuerza ({cambio_pct:+.2f}%), "
-                f"contradiciendo la falta de dirección detectada en su momento."
-            )
-    else:
-        direccion = 1 if sesgo == "alcista" else -1
-        movimiento_a_favor = cambio_pct * direccion
-
-        invalidado = False
-        if invalidacion is not None:
-            if sesgo == "alcista" and precio_final <= invalidacion:
-                invalidado = True
-            elif sesgo == "bajista" and precio_final >= invalidacion:
-                invalidado = True
-
-        etapas_alcanzadas = 0
-        for e in etapas:
-            nivel = e.get("nivel")
-            if nivel is None:
-                continue
-            if sesgo == "alcista" and precio_final >= nivel:
-                etapas_alcanzadas += 1
-            elif sesgo == "bajista" and precio_final <= nivel:
-                etapas_alcanzadas += 1
-
-        if invalidado:
-            veracidad = max(5, round(20 - min(abs(movimiento_a_favor) * 3, 15)))
-            detalle = (
-                f"Sesgo {sesgo} INVALIDADO: precio llegó a ${precio_final:,.0f} "
-                f"({cambio_pct:+.2f}% desde emisión), cruzando el nivel de invalidación "
-                f"declarado (${invalidacion:,.0f})."
-            )
-        elif movimiento_a_favor > 0:
-            veracidad = min(95, round(50 + etapas_alcanzadas * 15 + min(movimiento_a_favor * 3, 20)))
-            detalle = (
-                f"Sesgo {sesgo} CONFIRMADO: precio se movió {movimiento_a_favor:+.2f}% "
-                f"a favor de la tesis, alcanzando {etapas_alcanzadas} de {len(etapas)} "
-                f"etapa(s) proyectada(s)."
-            )
-        else:
-            texto_invalidacion = f" sin llegar a invalidar (${invalidacion:,.0f})" if invalidacion is not None else ""
-            veracidad = max(15, round(45 - abs(movimiento_a_favor) * 5))
-            detalle = (
-                f"Sesgo {sesgo} sin confirmar: precio se movió {abs(movimiento_a_favor):.2f}% "
-                f"en contra de la tesis{texto_invalidacion}."
-            )
-
-    return {
-        "veracidad_pct": veracidad,
-        "detalle": detalle,
-        "precio_evaluacion": round(precio_final, 1),
-        "ts_evaluacion": ahora.isoformat(),
-    }
-
-
-def _evaluar_predicciones_pendientes():
-    """
-    Revisa las tesis guardadas sin evaluar todavía y, para las que ya
-    pasaron ~INTERVALO_PREDICCION_HORAS desde su emisión (1 hora antes
-    de que pasen a VENCIDA), les calcula la autoevaluación de veracidad
-    usando el precio actual. Pide UN solo precio (klines chicas) y lo
-    reusa para todas las tesis que corresponda evaluar en este ciclo,
-    para no gastar peso de más contra Binance.
-    """
-    with _PREDICCIONES_LOCK:
-        pendientes = [p for p in _PREDICCIONES if p.get("evaluacion") is None]
-
-    if not pendientes:
-        return
-
-    ahora = datetime.now(timezone.utc)
-
-    hay_que_evaluar = False
-    for pred in pendientes:
-        try:
-            ts_emision = datetime.fromisoformat(pred["ts_emision"])
-        except Exception:
-            continue
-        if ahora >= ts_emision + timedelta(hours=INTERVALO_PREDICCION_HORAS):
-            hay_que_evaluar = True
-            break
-
-    if not hay_que_evaluar or _grupo_baneado("spot"):
-        return
-
-    velas, status = _proxy_get(
-        DOMINIOS_SPOT, "/api/v3/klines",
-        {"symbol": "BTCUSDT", "interval": "15m", "limit": 3}, grupo="spot",
-    )
-    if not isinstance(velas, list) or not velas:
-        return
-    precio_actual = float(velas[-1][4])
-
-    huvo_cambios = False
-    with _PREDICCIONES_LOCK:
-        for pred in _PREDICCIONES:
-            if pred.get("evaluacion") is not None:
-                continue
-            try:
-                ts_emision = datetime.fromisoformat(pred["ts_emision"])
-            except Exception:
-                continue
-            if ahora >= ts_emision + timedelta(hours=INTERVALO_PREDICCION_HORAS):
-                pred["evaluacion"] = _evaluar_prediccion(pred, precio_actual, ahora)
-                huvo_cambios = True
-        if huvo_cambios:
-            _guardar_predicciones_disco(_PREDICCIONES)
+        "resultado": None,  # se sella más adelante, cuando se emita la próxima tesis
+    }, velas_completas
 
 
 def _cargar_predicciones_disco():
@@ -679,55 +659,121 @@ def _guardar_predicciones_disco(lista):
         pass  # filesystem read-only u otro problema puntual -- no rompe el hilo
 
 
+def _ejecutar_ciclo_generacion(forzar=False, bloquear=True):
+    """
+    Corre UN ciclo de generación (generar + sellar + guardar), protegido
+    por _GENERACION_LOCK -- este lock es compartido entre el hilo de
+    fondo y el disparo on-demand de abajo, así nunca corren dos
+    generaciones en simultáneo (dos pedidos a Binance/Deribit a la vez
+    por la misma tesis).
+
+    bloquear=True (usado por el hilo de fondo): espera el lock si está
+    ocupado -- no hay apuro, el hilo tiene las 5hs completas por delante.
+
+    bloquear=False (usado por el disparo on-demand del endpoint): si el
+    lock ya está tomado por otra generación en curso, NO espera, sale
+    inmediatamente -- así un request de un usuario no se cuelga
+    esperando que termine un ciclo ajeno.
+
+    forzar=True: ignora el cooldown de 2 minutos (lo usa el hilo de
+    fondo, que ya decide su propio ritmo con time.sleep). forzar=False
+    respeta el cooldown -- evita que refreshes de 15s del dashboard
+    disparen un intento de generación cada vez que la anterior está
+    vencida pero la de ahora también falló.
+
+    Devuelve True si efectivamente generó y guardó una tesis nueva.
+    """
+    global _PREDICCIONES, _ULTIMO_INTENTO_GENERACION
+
+    adquirido = _GENERACION_LOCK.acquire(blocking=bloquear)
+    if not adquirido:
+        return False
+
+    try:
+        if not forzar and (time.time() - _ULTIMO_INTENTO_GENERACION) < 120:
+            return False
+        _ULTIMO_INTENTO_GENERACION = time.time()
+
+        pred, velas_completas = _generar_prediccion()
+        if not pred:
+            return False
+
+        ahora_ciclo = datetime.now(timezone.utc)
+        with _PREDICCIONES_LOCK:
+            _sellar_predicciones_pendientes_sin_lock(velas_completas, ahora_ciclo)
+            _PREDICCIONES.insert(0, pred)
+            _PREDICCIONES = _PREDICCIONES[:MAX_PREDICCIONES_GUARDADAS]
+            _guardar_predicciones_disco(_PREDICCIONES)
+        return True
+    except Exception as e:
+        print(f"[predicciones] error generando tesis: {e}")
+        return False
+    finally:
+        _GENERACION_LOCK.release()
+
+
+def _generar_si_corresponde():
+    """
+    Disparo ON-DEMAND: se llama al principio de /predicciones, en cada
+    request real de un usuario. Si no hay ninguna tesis guardada, o la
+    más reciente ya venció su intervalo de INTERVALO_PREDICCION_HORAS,
+    dispara un ciclo de generación ahí mismo (sin bloquear si ya hay
+    uno en curso -- ver _ejecutar_ciclo_generacion).
+
+    POR QUÉ HACE FALTA ESTO (no solo el hilo de fondo): en el free tier
+    de Render, el servicio se duerme por inactividad y el hilo de fondo
+    muere con el proceso. Si nadie visita la app en horas, el hilo
+    nunca llega a completar un ciclo, y el reintento de
+    INTERVALO_REINTENTO_MINUTOS no sirve de nada porque el proceso ya
+    no existe para reintentar. Enganchar la generación al propio
+    request del usuario es lo que garantiza que, apenas alguien abre
+    el dashboard (lo que sea que haya despertado el servicio), la tesis
+    pendiente se genera en ese momento -- no depende de que el proceso
+    haya seguido despierto solo, dormido, esperando su turno.
+    """
+    with _PREDICCIONES_LOCK:
+        hay_predicciones = len(_PREDICCIONES) > 0
+        vencida = True
+        if hay_predicciones:
+            try:
+                ultima = datetime.fromisoformat(_PREDICCIONES[0]["ts_emision"])
+                vencida = (datetime.now(timezone.utc) - ultima).total_seconds() >= INTERVALO_PREDICCION_HORAS * 3600
+            except Exception:
+                vencida = True
+
+    if hay_predicciones and not vencida:
+        return  # la más reciente sigue vigente, nada que generar todavía
+
+    _ejecutar_ciclo_generacion(forzar=False, bloquear=False)
+
+
 def _hilo_generador_predicciones():
     """
-    Corre indefinidamente en ciclos cortos (INTERVALO_CHEQUEO_MINUTOS),
-    y en cada ciclo:
-      1. Revisa si hay tesis pendientes de autoevaluación (ver
-         _evaluar_predicciones_pendientes) -- esto se hace en CADA
-         ciclo corto, no solo cuando toca generar una tesis nueva, para
-         que la autoevaluación esté lista ~1hs antes de la próxima tesis.
-      2. Genera una tesis nueva solo si ya pasó INTERVALO_PREDICCION_HORAS
-         desde la última generación exitosa.
-
-    FIX (bug reportado: predicciones venía vacío): antes, si el primer
-    intento de generar fallaba (ban -1003 activo al arrancar, Deribit
-    caído, redeploy de Render justo en ese momento), el hilo esperaba
-    el INTERVALO COMPLETO (horas) antes de volver a intentar -- podía
-    dejar el endpoint /predicciones vacío por horas sin necesidad. Ahora
-    un fallo reintenta en REINTENTO_FALLO_MINUTOS, no en horas.
+    Best-effort mientras el proceso esté despierto: intenta un ciclo
+    cada INTERVALO_PREDICCION_HORAS (o cada INTERVALO_REINTENTO_MINUTOS
+    si el ciclo anterior falló). Complementa -- no reemplaza -- al
+    disparo on-demand de _generar_si_corresponde: si el servicio se
+    mantiene despierto por tráfico constante, este hilo solo mantiene
+    el ritmo regular sin depender de que llegue un request justo cuando
+    toca. Comparte _GENERACION_LOCK con el disparo on-demand, así nunca
+    se pisan.
 
     LÍMITE HONESTO (mismo que contador_sesiones.json en main.py): el
     disco de Render free tier no es 100% persistente a largo plazo
-    (puede perderse en un redeploy) -- alcanza para sobrevivir
-    reinicios normales del proceso dentro de la misma instancia, no
-    para historial permanente.
+    (puede perderse en un redeploy o al dormirse/despertar el
+    servicio) -- por eso existe además el disparo on-demand, que no
+    depende de que este hilo haya sobrevivido.
     """
     global _PREDICCIONES
     with _PREDICCIONES_LOCK:
         _PREDICCIONES = _cargar_predicciones_disco()
 
-    proxima_generacion = time.time()  # intenta generar apenas arranca el proceso
-
     while True:
-        try:
-            _evaluar_predicciones_pendientes()
-
-            if time.time() >= proxima_generacion:
-                pred = _generar_prediccion()
-                if pred:
-                    with _PREDICCIONES_LOCK:
-                        _PREDICCIONES.insert(0, pred)
-                        _PREDICCIONES = _PREDICCIONES[:MAX_PREDICCIONES_GUARDADAS]
-                        _guardar_predicciones_disco(_PREDICCIONES)
-                    proxima_generacion = time.time() + INTERVALO_PREDICCION_HORAS * 3600
-                else:
-                    proxima_generacion = time.time() + REINTENTO_FALLO_MINUTOS * 60
-        except Exception as e:
-            print(f"[predicciones] error en ciclo: {e}")
-            proxima_generacion = max(proxima_generacion, time.time() + REINTENTO_FALLO_MINUTOS * 60)
-
-        time.sleep(INTERVALO_CHEQUEO_MINUTOS * 60)
+        generado = _ejecutar_ciclo_generacion(forzar=True, bloquear=True)
+        if generado:
+            time.sleep(INTERVALO_PREDICCION_HORAS * 3600)
+        else:
+            time.sleep(INTERVALO_REINTENTO_MINUTOS * 60)
 
 
 threading.Thread(target=_hilo_generador_predicciones, daemon=True).start()
@@ -735,37 +781,13 @@ threading.Thread(target=_hilo_generador_predicciones, daemon=True).start()
 
 @app.route("/predicciones")
 def predicciones():
+    _generar_si_corresponde()
     with _PREDICCIONES_LOCK:
         lista = list(_PREDICCIONES)
     return jsonify({
         "predicciones": lista,
         "intervalo_horas": INTERVALO_PREDICCION_HORAS,
-        "max_guardadas": MAX_PREDICCIONES_GUARDADAS,
     })
-
-
-@app.route("/predicciones/generar_ahora")
-def forzar_prediccion():
-    """
-    Fuerza la generación de UNA tesis ya mismo, sin esperar el
-    intervalo de 4hs -- pensado para probar que el fix (retry corto en
-    vez de esperar horas) funciona después de un redeploy, no para uso
-    normal del dashboard (el hilo de background ya genera solo).
-    """
-    pred = _generar_prediccion()
-    if not pred:
-        return jsonify({
-            "error": "No se pudo generar (ban -1003 activo, o Deribit/Binance sin datos suficientes este intento).",
-            "ban_spot_activo": _grupo_baneado("spot"),
-            "ban_futures_activo": _grupo_baneado("futures"),
-        }), 503
-
-    with _PREDICCIONES_LOCK:
-        _PREDICCIONES.insert(0, pred)
-        _PREDICCIONES[:] = _PREDICCIONES[:MAX_PREDICCIONES_GUARDADAS]
-        _guardar_predicciones_disco(_PREDICCIONES)
-
-    return jsonify({"ok": True, "prediccion": pred})
 
 
 @app.route("/ticker24hr")

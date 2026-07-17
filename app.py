@@ -367,58 +367,94 @@ def _tendencia_sma(velas, periodo=20):
     return "neutral"
 
 
-def _evaluar_resultado_prediccion(pred, velas_ventana):
+def _agregar_etapas(candidatos):
     """
-    Recorre CRONOLÓGICAMENTE las velas transcurridas desde la emisión de
-    una tesis hasta ahora, y determina qué pasó primero: ¿tocó las
-    etapas proyectadas en orden, o tocó la invalidación antes? Esto es
-    lo que le da sentido real al % (no es "el precio llegó cerca en
-    algún momento", es "en qué orden ocurrieron las cosas").
-
-    Devuelve dict: {acierto_pct, estado, etapas_alcanzadas, etapas_total, invalidada}
+    Convierte una lista de (nivel, fuente) en hasta 3 etapas ordenadas,
+    evitando 2 niveles casi pegados (ej. wall y swing a $30 de
+    distancia cuentan como "la misma etapa"). Elevada a nivel de módulo
+    (antes vivía adentro de _generar_prediccion) porque ahora la usan
+    TANTO el escenario A como el escenario B contingente -- ver
+    _construir_escenario_b.
     """
-    sesgo = pred.get("sesgo")
-    etapas = pred.get("etapas", [])
-    invalidacion = pred.get("invalidacion")
-    precio_emision = pred.get("precio_emision")
+    vistos = set()
+    resultado = []
+    for nivel, fuente in sorted(candidatos, key=lambda c: c[0]):
+        clave = round(nivel / 50)
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+        resultado.append({"nivel": round(nivel, 1), "fuente": fuente})
+        if len(resultado) >= 3:
+            break
+    return resultado
 
-    if sesgo == "neutral" or not etapas or precio_emision is None or not velas_ventana:
-        return {
-            "acierto_pct": None, "estado": "sin_direccion", "invalidada": False,
-            "etapas_alcanzadas": 0, "etapas_total": len(etapas),
-        }
 
-    # Etapas en orden de cercanía (alcista: ascendente: bajista: descendente)
-    niveles_ordenados = sorted([e["nivel"] for e in etapas], reverse=(sesgo == "bajista"))
+def _construir_escenario_b(sesgo_a, invalidacion_a, invalidacion_a_fuente, precio_emision,
+                            soportes, resistencias, call_wall, put_wall, flip):
+    """
+    ESCENARIO B (contingente) -- pedido explícito del usuario: "donde
+    se invalida A, ahí arranca B". No es una tesis independiente desde
+    cero, es la CONTINUACIÓN lógica: si el nivel que sostenía la tesis
+    A se rompe, ese mismo quiebre habilita la tesis opuesta, con sus
+    propias etapas (mismos candidatos que ya se calcularon para A --
+    swings, walls, flip -- pero del lado opuesto y más allá del punto
+    de partida) y su propia invalidación.
 
-    invalidada = False
-    idx_etapa = 0
+    Invalidación de B: el precio de emisión ORIGINAL de la tesis A. Si
+    el precio recupera ese nivel, ya volvió al terreno donde A todavía
+    era válida -- ninguno de los dos escenarios tiene sentido seguir
+    evaluándolo más allá de ese punto. Simétrico, sin inventar un
+    criterio nuevo.
 
-    for vela in velas_ventana:
-        high, low = float(vela[2]), float(vela[3])
+    Devuelve None si sesgo_a es neutral, si no hay invalidación de A
+    definida, o si no se encontró ningún nivel claro más allá del
+    punto de partida (mejor no armar un B vacío a forzar uno con
+    candidatos inventados).
+    """
+    if sesgo_a not in ("alcista", "bajista") or invalidacion_a is None:
+        return None
 
-        if invalidacion is not None:
-            if sesgo == "alcista" and low <= invalidacion:
-                invalidada = True
-                break
-            if sesgo == "bajista" and high >= invalidacion:
-                invalidada = True
-                break
+    sesgo_b = "bajista" if sesgo_a == "alcista" else "alcista"
 
-        while idx_etapa < len(niveles_ordenados):
-            nivel = niveles_ordenados[idx_etapa]
-            tocado = (sesgo == "alcista" and high >= nivel) or (sesgo == "bajista" and low <= nivel)
-            if tocado:
-                idx_etapa += 1
-            else:
-                break
+    if sesgo_b == "bajista":
+        candidatos = [(s, "Imán soporte (liquidez)") for s in soportes if s < invalidacion_a]
+        if put_wall and put_wall["strike"] < invalidacion_a:
+            candidatos.append((put_wall["strike"], "Put Wall (OI opciones)"))
+        if flip is not None and flip < invalidacion_a:
+            candidatos.append((flip, "Flip Gamma (régimen)"))
+        candidatos.sort(key=lambda c: -c[0])
+        etapas_b = _agregar_etapas([(-n, f) for n, f in candidatos])
+        etapas_b = [{"nivel": -e["nivel"], "fuente": e["fuente"]} for e in etapas_b]
+    else:
+        candidatos = [(r, "Imán resistencia (liquidez)") for r in resistencias if r > invalidacion_a]
+        if call_wall and call_wall["strike"] > invalidacion_a:
+            candidatos.append((call_wall["strike"], "Call Wall (OI opciones)"))
+        if flip is not None and flip > invalidacion_a:
+            candidatos.append((flip, "Flip Gamma (régimen)"))
+        etapas_b = _agregar_etapas(candidatos)
 
-    etapas_alcanzadas = idx_etapa
-    etapas_total = len(niveles_ordenados)
+    if not etapas_b:
+        return None
 
+    return {
+        "sesgo": sesgo_b,
+        "punto_partida": invalidacion_a,
+        "punto_partida_fuente": invalidacion_a_fuente,
+        "etapas": etapas_b,
+        "invalidacion": precio_emision,
+        "invalidacion_fuente": "Recuperación del precio de emisión original (tesis A)",
+    }
+
+
+def _armar_resultado_escenario(etapas_alcanzadas, etapas_total, invalidada, sesgo, precio_partida,
+                                niveles_ordenados, velas_ventana):
+    """
+    Puntaje de UN escenario (A o B) ya recorrido cronológicamente --
+    factorizado acá porque la misma lógica de scoring aplica a ambos,
+    ver _evaluar_resultado_prediccion para el recorrido cronológico en
+    sí (que sí difiere entre A y B).
+    """
     if invalidada:
-        # Crédito parcial reducido: si alcanzó algo antes de invalidarse,
-        # no es lo mismo que invalidarse en la primera vela.
         acierto_pct = round((etapas_alcanzadas / etapas_total) * 100 * 0.3) if etapas_total else 0
         estado = "invalidada"
     elif etapas_total > 0 and etapas_alcanzadas == etapas_total:
@@ -427,19 +463,20 @@ def _evaluar_resultado_prediccion(pred, velas_ventana):
     elif etapas_alcanzadas > 0:
         acierto_pct = round((etapas_alcanzadas / etapas_total) * 100)
         estado = "parcial"
-    else:
-        # Todavía no tocó nada ni se invalidó: % de avance proporcional
-        # a la distancia recorrida hacia la primera etapa proyectada.
+    elif etapas_total > 0 and velas_ventana:
         primera_etapa = niveles_ordenados[0]
-        distancia_total = abs(primera_etapa - precio_emision)
+        distancia_total = abs(primera_etapa - precio_partida)
         precio_final_ventana = float(velas_ventana[-1][4])
         avance = (
-            (precio_final_ventana - precio_emision) if sesgo == "alcista"
-            else (precio_emision - precio_final_ventana)
+            (precio_final_ventana - precio_partida) if sesgo == "alcista"
+            else (precio_partida - precio_final_ventana)
         )
         progreso = max(0.0, min(avance / distancia_total, 1.0)) if distancia_total > 0 else 0.0
         acierto_pct = round(progreso * 100)
         estado = "en_curso"
+    else:
+        acierto_pct = 0
+        estado = "sin_datos"
 
     return {
         "acierto_pct": acierto_pct,
@@ -447,6 +484,135 @@ def _evaluar_resultado_prediccion(pred, velas_ventana):
         "invalidada": invalidada,
         "etapas_alcanzadas": etapas_alcanzadas,
         "etapas_total": etapas_total,
+    }
+
+
+PESO_ESCENARIO_A = 0.65  # la tesis principal siempre pesa más...
+PESO_ESCENARIO_B = 0.35  # ...pero B compensa para que "A invalidada" no quede en 0 sin matices
+
+
+def _evaluar_resultado_prediccion(pred, velas_ventana):
+    """
+    Recorre CRONOLÓGICAMENTE las velas transcurridas desde la emisión de
+    una tesis hasta ahora. Ahora en DOS fases:
+
+    FASE A: evalúa la tesis principal -- ¿tocó las etapas proyectadas
+    en orden, o tocó la invalidación de A antes?
+
+    FASE B (solo si A se invalidó Y la tesis tiene escenario_b): a
+    partir de la vela donde A se invalidó, sigue recorriendo pero
+    ahora evaluando el escenario contingente -- ¿tocó las etapas de B,
+    o volvió a superar la invalidación de B (que es el precio de
+    emisión original) antes?
+
+    El % final es un promedio ponderado (A pesa más, ver
+    PESO_ESCENARIO_A/B) -- si A nunca se invalidó, B ni se evalúa y el
+    % es 100% el de A.
+
+    Devuelve dict: {acierto_pct, estado, etapas_alcanzadas, etapas_total,
+    invalidada, escenario_b_resultado, peso_a, peso_b}
+    """
+    sesgo = pred.get("sesgo")
+    etapas = pred.get("etapas", [])
+    invalidacion = pred.get("invalidacion")
+    precio_emision = pred.get("precio_emision")
+    escenario_b = pred.get("escenario_b")
+
+    if sesgo == "neutral" or not etapas or precio_emision is None or not velas_ventana:
+        return {
+            "acierto_pct": None, "estado": "sin_direccion", "invalidada": False,
+            "etapas_alcanzadas": 0, "etapas_total": len(etapas),
+            "escenario_b_resultado": None, "peso_a": 1.0, "peso_b": 0.0,
+        }
+
+    # --- FASE A ---
+    niveles_a = sorted([e["nivel"] for e in etapas], reverse=(sesgo == "bajista"))
+
+    invalidada_a = False
+    idx_a = 0
+    idx_vela_quiebre = None
+
+    for i, vela in enumerate(velas_ventana):
+        high, low = float(vela[2]), float(vela[3])
+
+        if invalidacion is not None:
+            if sesgo == "alcista" and low <= invalidacion:
+                invalidada_a = True
+                idx_vela_quiebre = i
+                break
+            if sesgo == "bajista" and high >= invalidacion:
+                invalidada_a = True
+                idx_vela_quiebre = i
+                break
+
+        while idx_a < len(niveles_a):
+            nivel = niveles_a[idx_a]
+            tocado = (sesgo == "alcista" and high >= nivel) or (sesgo == "bajista" and low <= nivel)
+            if tocado:
+                idx_a += 1
+            else:
+                break
+
+    resultado_a = _armar_resultado_escenario(
+        idx_a, len(niveles_a), invalidada_a, sesgo, precio_emision, niveles_a, velas_ventana,
+    )
+
+    # --- FASE B (solo si A se invalidó y hay escenario contingente) ---
+    resultado_b = None
+
+    if invalidada_a and escenario_b and idx_vela_quiebre is not None:
+        velas_fase_b = velas_ventana[idx_vela_quiebre:]
+        sesgo_b = escenario_b.get("sesgo")
+        invalidacion_b = escenario_b.get("invalidacion")
+        precio_partida_b = escenario_b.get("punto_partida", precio_emision)
+        niveles_b = sorted(
+            [e["nivel"] for e in escenario_b.get("etapas", [])], reverse=(sesgo_b == "bajista")
+        )
+
+        invalidada_b = False
+        idx_b = 0
+
+        for vela in velas_fase_b:
+            high, low = float(vela[2]), float(vela[3])
+
+            if invalidacion_b is not None:
+                if sesgo_b == "alcista" and low <= invalidacion_b:
+                    invalidada_b = True
+                    break
+                if sesgo_b == "bajista" and high >= invalidacion_b:
+                    invalidada_b = True
+                    break
+
+            while idx_b < len(niveles_b):
+                nivel = niveles_b[idx_b]
+                tocado = (sesgo_b == "alcista" and high >= nivel) or (sesgo_b == "bajista" and low <= nivel)
+                if tocado:
+                    idx_b += 1
+                else:
+                    break
+
+        resultado_b = _armar_resultado_escenario(
+            idx_b, len(niveles_b), invalidada_b, sesgo_b, precio_partida_b, niveles_b, velas_fase_b,
+        )
+
+    if resultado_b is not None:
+        acierto_pct = round(
+            resultado_a["acierto_pct"] * PESO_ESCENARIO_A + resultado_b["acierto_pct"] * PESO_ESCENARIO_B
+        )
+        peso_b_usado = PESO_ESCENARIO_B
+    else:
+        acierto_pct = resultado_a["acierto_pct"]
+        peso_b_usado = 0.0
+
+    return {
+        "acierto_pct": acierto_pct,
+        "estado": resultado_a["estado"],
+        "invalidada": invalidada_a,
+        "etapas_alcanzadas": resultado_a["etapas_alcanzadas"],
+        "etapas_total": resultado_a["etapas_total"],
+        "escenario_b_resultado": resultado_b,
+        "peso_a": 1.0 - peso_b_usado,
+        "peso_b": peso_b_usado,
     }
 
 
@@ -509,11 +675,26 @@ def _generar_prediccion():
     if not isinstance(velas_completas, list) or len(velas_completas) < 30:
         return None, None
 
-    velas = velas_completas[-100:]  # ventana corta para tendencia/swing, mismo criterio que antes
+    velas = velas_completas[-100:]  # ventana corta (~25hs), sigue siendo la que alimenta tendencia (SMA20 15M)
+
+    # Ventana ANCHA para detección de swings (~62hs / 2.6 días) -- pedido
+    # explícito del usuario: los niveles de continuación venían muy
+    # cortos (100-150 USD de distancia) porque la ventana de 25hs con
+    # ventana=5 velas solo agarraba ruido de la última hora. Con más
+    # historial y una ventana de confirmación más ancha, los swings
+    # detectados son estructura real de rango, no ruido de corto plazo.
+    # Ventana de detección de swings: 12hs (48 velas de 15m) -- CORREGIDO
+    # (la versión anterior miraba 62hs atrás, inconsistente con que la
+    # tesis solo vale ~4-5hs: estructura de 2-3 días atrás no es
+    # relevante para el próximo movimiento de corto plazo, solo metía
+    # ruido de otro régimen de mercado). 12hs es coherente con el
+    # horizonte real de la predicción -- "para saber qué pasa en las
+    # próximas 4hs, mirar las últimas 12hs" (pedido explícito del usuario).
+    velas_para_swings = velas_completas[-48:] if len(velas_completas) >= 48 else velas_completas
+    soportes, resistencias = _swing_niveles(velas_para_swings, ventana=5, max_niveles=4)
+    tendencia = _tendencia_sma(velas)
 
     precio_actual = float(velas[-1][4])
-    soportes, resistencias = _swing_niveles(velas)
-    tendencia = _tendencia_sma(velas)
 
     funding_valor = None
     fbody, _ = _proxy_get_simple(f"{DOMINIO_FUTURES}/fapi/v1/premiumIndex", {"symbol": "BTCUSDT"}, grupo="futures")
@@ -567,24 +748,26 @@ def _generar_prediccion():
     invalidacion = None
     invalidacion_fuente = None
 
-    def _agregar_etapas(candidatos):
-        vistos = set()
-        resultado = []
-        for nivel, fuente in sorted(candidatos, key=lambda c: c[0]):
-            clave = round(nivel / 50)  # evita 2 niveles casi pegados (ej. wall y swing a $30 de distancia)
-            if clave in vistos:
-                continue
-            vistos.add(clave)
-            resultado.append({"nivel": round(nivel, 1), "fuente": fuente})
-            if len(resultado) >= 3:
-                break
-        return resultado
+    # Distancia mínima entre el precio actual y cualquier nivel candidato
+    # a etapa -- pedido explícito del usuario: las proyecciones quedaban
+    # demasiado cortas (100-150 USD), sin margen real para una tesis de
+    # varias horas. 350 USD queda a mitad del rango pedido (300-500).
+    # Distancia mínima entre el precio actual y cualquier nivel candidato
+    # a etapa (profit) -- pedido explícito del usuario: 300 USD como piso,
+    # apuntando a objetivos de 300-600 USD. El stop (invalidación) NO
+    # lleva este piso -- con la ventana de 12hs ya cae naturalmente en
+    # el rango de 200-300 que el usuario espera para el stop, sin
+    # necesidad de un filtro adicional ahí.
+    DISTANCIA_MINIMA_ETAPA_USD = 300
 
     if sesgo == "alcista":
-        candidatos = [(r, "Imán resistencia (liquidez)") for r in resistencias if r > precio_actual]
-        if call_wall and call_wall["strike"] > precio_actual:
+        candidatos = [
+            (r, "Imán resistencia (liquidez)") for r in resistencias
+            if r > precio_actual + DISTANCIA_MINIMA_ETAPA_USD
+        ]
+        if call_wall and call_wall["strike"] > precio_actual + DISTANCIA_MINIMA_ETAPA_USD:
             candidatos.append((call_wall["strike"], "Call Wall (OI opciones)"))
-        if flip is not None and flip > precio_actual:
+        if flip is not None and flip > precio_actual + DISTANCIA_MINIMA_ETAPA_USD:
             candidatos.append((flip, "Flip Gamma (régimen)"))
         etapas = _agregar_etapas(candidatos)
         if soportes:
@@ -592,10 +775,13 @@ def _generar_prediccion():
             invalidacion_fuente = "Imán soporte reciente"
 
     elif sesgo == "bajista":
-        candidatos = [(r, "Imán soporte (liquidez)") for r in soportes if r < precio_actual]
-        if put_wall and put_wall["strike"] < precio_actual:
+        candidatos = [
+            (r, "Imán soporte (liquidez)") for r in soportes
+            if r < precio_actual - DISTANCIA_MINIMA_ETAPA_USD
+        ]
+        if put_wall and put_wall["strike"] < precio_actual - DISTANCIA_MINIMA_ETAPA_USD:
             candidatos.append((put_wall["strike"], "Put Wall (OI opciones)"))
-        if flip is not None and flip < precio_actual:
+        if flip is not None and flip < precio_actual - DISTANCIA_MINIMA_ETAPA_USD:
             candidatos.append((flip, "Flip Gamma (régimen)"))
         # ordenamos de más cercano a más lejano igual (candidatos ya vienen < precio_actual)
         candidatos.sort(key=lambda c: -c[0])
@@ -606,10 +792,17 @@ def _generar_prediccion():
             invalidacion_fuente = "Imán resistencia reciente"
 
     else:
-        if resistencias:
-            etapas.append({"nivel": round(resistencias[0], 1), "fuente": "Imán resistencia (liquidez)"})
-        if soportes:
-            etapas.append({"nivel": round(soportes[0], 1), "fuente": "Imán soporte (liquidez)"})
+        resistencias_lejos = [r for r in resistencias if r > precio_actual + DISTANCIA_MINIMA_ETAPA_USD]
+        soportes_lejos = [s for s in soportes if s < precio_actual - DISTANCIA_MINIMA_ETAPA_USD]
+        if resistencias_lejos:
+            etapas.append({"nivel": round(resistencias_lejos[0], 1), "fuente": "Imán resistencia (liquidez)"})
+        if soportes_lejos:
+            etapas.append({"nivel": round(soportes_lejos[0], 1), "fuente": "Imán soporte (liquidez)"})
+
+    escenario_b = _construir_escenario_b(
+        sesgo, invalidacion, invalidacion_fuente, round(precio_actual, 1),
+        soportes, resistencias, call_wall, put_wall, flip,
+    )
 
     if etapas:
         resumen = (
@@ -636,6 +829,7 @@ def _generar_prediccion():
         "etapas": etapas,
         "invalidacion": invalidacion,
         "invalidacion_fuente": invalidacion_fuente,
+        "escenario_b": escenario_b,
         "resumen": resumen,
         "resultado": None,  # se sella más adelante, cuando se emita la próxima tesis
     }, velas_completas

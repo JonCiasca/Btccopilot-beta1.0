@@ -35,8 +35,8 @@ sock = Sock(app)
 _CACHE = {}
 _CACHE_LOCK = threading.Lock()
 
-TTL_RAPIDO = 8
-TTL_LENTO = 10
+TTL_RAPIDO = 4
+TTL_LENTO = 8
 
 
 def _get_con_cache(cache_key, fetch_fn, ttl_segundos=TTL_RAPIDO):
@@ -660,10 +660,27 @@ def _generar_prediccion():
     emitir una tesis fabricada con datos incompletos.
 
     Devuelve (pred_dict, velas_completas): velas_completas es la lista
-    cruda de klines (limit=400, ~100hs) que además de usarse acá para
-    tendencia/swing de corto plazo, se reutiliza afuera (en el hilo)
-    para SELLAR con % de acierto las tesis anteriores -- así no hace
-    falta un segundo pedido a Binance solo para eso.
+    cruda de klines (limit=100, ~25hs) que además de usarse acá para
+    tendencia/swing, se reutiliza afuera (en el hilo) para SELLAR con
+    % de acierto las tesis anteriores -- así no hace falta un segundo
+    pedido a Binance solo para eso.
+
+    PESO CONTRA BINANCE (ajustado): antes pedía limit=400, que cae en
+    el bucket de peso 2 de Binance (101-500 velas). Bajado a limit=100
+    -- mismo bucket de peso 1 que usa el resto de la app (klines,
+    ticker, etc.) -- porque el disparo on-demand (ver
+    _generar_si_corresponde) hace que este pedido ya NO dependa solo
+    del reloj del hilo de fondo cada 5hs, sino que también puede
+    dispararse desde cualquier sesión que entra al dashboard con la
+    tesis vencida. Eso suma peso real que antes no existía, así que
+    hay que mantenerlo lo más liviano posible.
+
+    LÍMITE ACEPTADO por esta reducción: 25hs de historial alcanza de
+    sobra para sellar la tesis pendiente típica (~5-6hs de brecha entre
+    una tesis y la siguiente), pero si el servicio estuvo caído varios
+    ciclos seguidos (>25hs sin generar nada), esas tesis muy viejas se
+    quedan sin sellar un poco más -- no rompen nada, solo esperan al
+    próximo ciclo con margen suficiente.
     """
     global _ULTIMO_ERROR_GENERACION
 
@@ -673,13 +690,9 @@ def _generar_prediccion():
 
     ahora = datetime.now(timezone.utc)
 
-    velas_completas, status = _get_con_cache(
-        "klines:BTCUSDT:15m:400",
-        lambda: _proxy_get(
-            DOMINIOS_SPOT, "/api/v3/klines",
-            {"symbol": "BTCUSDT", "interval": "15m", "limit": 400}, grupo="spot",
-        ),
-        ttl_segundos=TTL_RAPIDO,
+    velas_completas, status = _proxy_get(
+        DOMINIOS_SPOT, "/api/v3/klines",
+        {"symbol": "BTCUSDT", "interval": "15m", "limit": 100}, grupo="spot",
     )
     if not isinstance(velas_completas, list) or len(velas_completas) < 30:
         _ULTIMO_ERROR_GENERACION = (
@@ -689,21 +702,13 @@ def _generar_prediccion():
         )
         return None, None
 
-    velas = velas_completas[-100:]  # ventana corta (~25hs), sigue siendo la que alimenta tendencia (SMA20 15M)
+    velas = velas_completas  # ahora la ventana corta y la completa son la misma (100 velas, ~25hs)
 
-    # Ventana ANCHA para detección de swings (~62hs / 2.6 días) -- pedido
-    # explícito del usuario: los niveles de continuación venían muy
-    # cortos (100-150 USD de distancia) porque la ventana de 25hs con
-    # ventana=5 velas solo agarraba ruido de la última hora. Con más
-    # historial y una ventana de confirmación más ancha, los swings
-    # detectados son estructura real de rango, no ruido de corto plazo.
-    # Ventana de detección de swings: 12hs (48 velas de 15m) -- CORREGIDO
-    # (la versión anterior miraba 62hs atrás, inconsistente con que la
-    # tesis solo vale ~4-5hs: estructura de 2-3 días atrás no es
-    # relevante para el próximo movimiento de corto plazo, solo metía
-    # ruido de otro régimen de mercado). 12hs es coherente con el
-    # horizonte real de la predicción -- "para saber qué pasa en las
-    # próximas 4hs, mirar las últimas 12hs" (pedido explícito del usuario).
+    # Ventana de detección de swings: 12hs (48 velas de 15m) -- coherente
+    # con que la tesis solo vale ~4-5hs (estructura de días atrás no es
+    # relevante para el próximo movimiento de corto plazo). "Para saber
+    # qué pasa en las próximas 4hs, mirar las últimas 12hs" (pedido
+    # explícito del usuario).
     velas_para_swings = velas_completas[-48:] if len(velas_completas) >= 48 else velas_completas
     soportes, resistencias = _swing_niveles(velas_para_swings, ventana=5, max_niveles=4)
     tendencia = _tendencia_sma(velas)
@@ -711,11 +716,7 @@ def _generar_prediccion():
     precio_actual = float(velas[-1][4])
 
     funding_valor = None
-    fbody, _ = _get_con_cache(
-        "premiumIndex:BTCUSDT",
-        lambda: _proxy_get_simple(f"{DOMINIO_FUTURES}/fapi/v1/premiumIndex", {"symbol": "BTCUSDT"}, grupo="futures"),
-        ttl_segundos=TTL_LENTO,
-    )
+    fbody, _ = _proxy_get_simple(f"{DOMINIO_FUTURES}/fapi/v1/premiumIndex", {"symbol": "BTCUSDT"}, grupo="futures")
     if isinstance(fbody, dict) and "lastFundingRate" in fbody:
         funding_valor = float(fbody["lastFundingRate"]) * 100
 
@@ -981,12 +982,6 @@ def _hilo_generador_predicciones():
     global _PREDICCIONES
     with _PREDICCIONES_LOCK:
         _PREDICCIONES = _cargar_predicciones_disco()
-    # Espera inicial: evita que el hilo de fondo pegue a Binance/Deribit
-    # en el mismo instante en que Render recién despertó el proceso y
-    # el primer request de Streamlit también está entrando -- eso es lo
-    # que gatilla el ban en cada arranque en frío. 45s de margen alcanza
-    # para que el primer request de usuario ya haya poblado el cache.
-    time.sleep(45)
 
     while True:
         generado = _ejecutar_ciclo_generacion(forzar=True, bloquear=True)

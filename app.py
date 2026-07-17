@@ -15,7 +15,7 @@ app = Flask(__name__)
 sock = Sock(app)
 
 # ----------------------------------
-# CACHE TTL GENERALIZADO (todos los endpoints REST a Binance)
+# CACHE TTL GENERALIZADO ( todos los endpoints REST a Binance)
 # ----------------------------------
 # ANTES: solo /depth y /futures/depth tenían cache. klines (pedido 4
 # VECES por refresh desde main.py: 5m, 15m, 1h + timeframe operativo)

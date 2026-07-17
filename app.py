@@ -8,6 +8,7 @@ import re
 import math
 import uuid
 import os
+import traceback
 from datetime import datetime, timezone, timedelta
 import websocket  # librería websocket-client
 
@@ -15,7 +16,7 @@ app = Flask(__name__)
 sock = Sock(app)
 
 # ----------------------------------
-# CACHE TTL GENERALIZADO ( todos los endpoints REST a Binance)
+# CACHE TTL GENERALIZADO (todos los endpoints REST a Binance)
 # ----------------------------------
 # ANTES: solo /depth y /futures/depth tenían cache. klines (pedido 4
 # VECES por refresh desde main.py: 5m, 15m, 1h + timeframe operativo)
@@ -197,6 +198,7 @@ _PREDICCIONES = []
 _PREDICCIONES_LOCK = threading.Lock()
 _GENERACION_LOCK = threading.Lock()  # exclusión mutua entre el hilo de fondo y el disparo on-demand
 _ULTIMO_INTENTO_GENERACION = 0  # timestamp (epoch) del último intento -- cooldown del disparo on-demand
+_ULTIMO_ERROR_GENERACION = None  # última razón de fallo (string), expuesta en /predicciones para diagnóstico rápido sin depender de leer logs de Render
 
 
 def _norm_pdf(x):
@@ -663,7 +665,10 @@ def _generar_prediccion():
     para SELLAR con % de acierto las tesis anteriores -- así no hace
     falta un segundo pedido a Binance solo para eso.
     """
+    global _ULTIMO_ERROR_GENERACION
+
     if _grupo_baneado("spot") or _grupo_baneado("futures"):
+        _ULTIMO_ERROR_GENERACION = "Ban activo (circuit breaker spot o futures) al momento del intento"
         return None, None
 
     ahora = datetime.now(timezone.utc)
@@ -673,6 +678,11 @@ def _generar_prediccion():
         {"symbol": "BTCUSDT", "interval": "15m", "limit": 400}, grupo="spot",
     )
     if not isinstance(velas_completas, list) or len(velas_completas) < 30:
+        _ULTIMO_ERROR_GENERACION = (
+            f"Klines insuficientes o inválidas: status_http={status}, "
+            f"tipo_respuesta={type(velas_completas).__name__}, "
+            f"contenido={str(velas_completas)[:200]}"
+        )
         return None, None
 
     velas = velas_completas[-100:]  # ventana corta (~25hs), sigue siendo la que alimenta tendencia (SMA20 15M)
@@ -877,7 +887,7 @@ def _ejecutar_ciclo_generacion(forzar=False, bloquear=True):
 
     Devuelve True si efectivamente generó y guardó una tesis nueva.
     """
-    global _PREDICCIONES, _ULTIMO_INTENTO_GENERACION
+    global _PREDICCIONES, _ULTIMO_INTENTO_GENERACION, _ULTIMO_ERROR_GENERACION
 
     adquirido = _GENERACION_LOCK.acquire(blocking=bloquear)
     if not adquirido:
@@ -898,9 +908,11 @@ def _ejecutar_ciclo_generacion(forzar=False, bloquear=True):
             _PREDICCIONES.insert(0, pred)
             _PREDICCIONES = _PREDICCIONES[:MAX_PREDICCIONES_GUARDADAS]
             _guardar_predicciones_disco(_PREDICCIONES)
+        _ULTIMO_ERROR_GENERACION = None  # ciclo exitoso -- limpia cualquier error viejo
         return True
     except Exception as e:
-        print(f"[predicciones] error generando tesis: {e}")
+        _ULTIMO_ERROR_GENERACION = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+        print(f"[predicciones] error generando tesis: {_ULTIMO_ERROR_GENERACION}")
         return False
     finally:
         _GENERACION_LOCK.release()
@@ -981,6 +993,7 @@ def predicciones():
     return jsonify({
         "predicciones": lista,
         "intervalo_horas": INTERVALO_PREDICCION_HORAS,
+        "ultimo_error_generacion": _ULTIMO_ERROR_GENERACION,
     })
 
 

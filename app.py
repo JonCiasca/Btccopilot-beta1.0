@@ -35,8 +35,8 @@ sock = Sock(app)
 _CACHE = {}
 _CACHE_LOCK = threading.Lock()
 
-TTL_RAPIDO = 4
-TTL_LENTO = 8
+TTL_RAPIDO = 8
+TTL_LENTO = 10
 
 
 def _get_con_cache(cache_key, fetch_fn, ttl_segundos=TTL_RAPIDO):

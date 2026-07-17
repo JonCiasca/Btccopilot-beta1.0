@@ -192,6 +192,11 @@ INTERVALO_REINTENTO_MINUTOS = 10  # si un ciclo falla (ban activo, timeout en fr
                                     # intervalo normal, o un fallo nocturno te deja sin
                                     # tesis toda la mañana siguiente.
 MAX_PREDICCIONES_GUARDADAS = 14  # ~2.9 días de historial (deja margen sobre las 7 que se muestran)
+COOLDOWN_ON_DEMAND_SEGUNDOS = 600  # 10 min -- antes eran 120s (2 min), subido tras el episodio de
+                                     # bans en cadena: con la tesis "vencida" indefinidamente (ciclos
+                                     # fallando) y varias sesiones reconectando cada 15s, 2 min de
+                                     # cooldown seguía dejando hasta 30 intentos/hora justo en el peor
+                                     # momento. 10 min baja eso a 6/hora como máximo.
 RUTA_PREDICCIONES = "predicciones.json"
 
 _PREDICCIONES = []
@@ -903,7 +908,7 @@ def _ejecutar_ciclo_generacion(forzar=False, bloquear=True):
         return False
 
     try:
-        if not forzar and (time.time() - _ULTIMO_INTENTO_GENERACION) < 120:
+        if not forzar and (time.time() - _ULTIMO_INTENTO_GENERACION) < COOLDOWN_ON_DEMAND_SEGUNDOS:
             return False
         _ULTIMO_INTENTO_GENERACION = time.time()
 
@@ -945,7 +950,21 @@ def _generar_si_corresponde():
     el dashboard (lo que sea que haya despertado el servicio), la tesis
     pendiente se genera en ese momento -- no depende de que el proceso
     haya seguido despierto solo, dormido, esperando su turno.
+
+    FIX (episodio real): si la generación viene fallando (ban activo,
+    Deribit caído, etc.), la tesis se queda "vencida" indefinidamente
+    -- y CADA sesión abierta, cada 15s (el auto-refresh del dashboard),
+    volvía a llamar acá. El cooldown interno de _ejecutar_ciclo_generacion
+    ya evitaba pedidos duplicados, pero a 2 minutos de cooldown eso
+    seguía siendo hasta 30 intentos/hora justo en el peor momento
+    (varias sesiones reconectando por señal inestable + ban activo).
+    Ahora, además de un cooldown más largo (10 min), se corta ACÁ MISMO
+    si hay un ban activo -- ni siquiera intenta tomar el lock, cero
+    trabajo de más mientras Binance ya está limitando la IP.
     """
+    if _grupo_baneado("spot") or _grupo_baneado("futures"):
+        return  # no sumar presión mientras el ban ya está activo
+
     with _PREDICCIONES_LOCK:
         hay_predicciones = len(_PREDICCIONES) > 0
         vencida = True
@@ -1023,7 +1042,7 @@ def generar_prediccion_manual():
     if generado:
         return jsonify({"ok": True, "mensaje": "Tesis nueva generada."})
 
-    segundos_cooldown_restantes = max(0, int(120 - (time.time() - _ULTIMO_INTENTO_GENERACION)))
+    segundos_cooldown_restantes = max(0, int(COOLDOWN_ON_DEMAND_SEGUNDOS - (time.time() - _ULTIMO_INTENTO_GENERACION)))
 
     if segundos_cooldown_restantes > 0:
         mensaje = f"Cooldown activo, esperá ~{segundos_cooldown_restantes}s e intentá de nuevo."

@@ -981,6 +981,12 @@ def _hilo_generador_predicciones():
     global _PREDICCIONES
     with _PREDICCIONES_LOCK:
         _PREDICCIONES = _cargar_predicciones_disco()
+    # Espera inicial: evita que el hilo de fondo pegue a Binance/Deribit
+    # en el mismo instante en que Render recién despertó el proceso y
+    # el primer request de Streamlit también está entrando -- eso es lo
+    # que gatilla el ban en cada arranque en frío. 45s de margen alcanza
+    # para que el primer request de usuario ya haya poblado el cache.
+    time.sleep(45)
 
     while True:
         generado = _ejecutar_ciclo_generacion(forzar=True, bloquear=True)

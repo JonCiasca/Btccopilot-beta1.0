@@ -673,9 +673,13 @@ def _generar_prediccion():
 
     ahora = datetime.now(timezone.utc)
 
-    velas_completas, status = _proxy_get(
-        DOMINIOS_SPOT, "/api/v3/klines",
-        {"symbol": "BTCUSDT", "interval": "15m", "limit": 400}, grupo="spot",
+    velas_completas, status = _get_con_cache(
+        "klines:BTCUSDT:15m:400",
+        lambda: _proxy_get(
+            DOMINIOS_SPOT, "/api/v3/klines",
+            {"symbol": "BTCUSDT", "interval": "15m", "limit": 400}, grupo="spot",
+        ),
+        ttl_segundos=TTL_RAPIDO,
     )
     if not isinstance(velas_completas, list) or len(velas_completas) < 30:
         _ULTIMO_ERROR_GENERACION = (
@@ -707,7 +711,11 @@ def _generar_prediccion():
     precio_actual = float(velas[-1][4])
 
     funding_valor = None
-    fbody, _ = _proxy_get_simple(f"{DOMINIO_FUTURES}/fapi/v1/premiumIndex", {"symbol": "BTCUSDT"}, grupo="futures")
+    fbody, _ = _get_con_cache(
+        "premiumIndex:BTCUSDT",
+        lambda: _proxy_get_simple(f"{DOMINIO_FUTURES}/fapi/v1/premiumIndex", {"symbol": "BTCUSDT"}, grupo="futures"),
+        ttl_segundos=TTL_LENTO,
+    )
     if isinstance(fbody, dict) and "lastFundingRate" in fbody:
         funding_valor = float(fbody["lastFundingRate"]) * 100
 

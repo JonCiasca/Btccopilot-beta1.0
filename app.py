@@ -16,6 +16,33 @@ app = Flask(__name__)
 sock = Sock(app)
 
 # ----------------------------------
+# INTERRUPTOR: FUNDING + OPEN INTEREST DE BINANCE — DADOS DE BAJA
+# ----------------------------------
+# premiumIndex (funding) y openInterest de Binance Futures venían
+# siendo la fuente principal de bans -1003 que tiraban abajo el
+# Copilot completo. Mientras esté en False, el proxy NO le pide más
+# esos dos datos a Binance: los endpoints /premiumIndex y
+# /openInterest responden 503 "dado de baja" al instante (sin tocar
+# Binance), y el motor de predicciones genera la tesis sin funding.
+# /futures/depth y el WebSocket relay NO se tocan (el relay es push,
+# no suma peso REST). Bybit tampoco se toca (rate-limit propio).
+#
+# Para reactivarlos: poner True acá y el mismo flag en main.py
+# (Streamlit) -- son dos repos distintos, hay que tocar los dos.
+BINANCE_FUNDING_OI_ACTIVO = False
+
+
+def _respuesta_dado_de_baja(nombre):
+    return {
+        "error": (
+            f"{nombre} de Binance dado de baja temporalmente en el proxy "
+            f"(protección anti-ban -1003). Reactivable con "
+            f"BINANCE_FUNDING_OI_ACTIVO = True en app.py."
+        ),
+        "deshabilitado": True,
+    }, 503
+
+# ----------------------------------
 # CACHE TTL GENERALIZADO (todos los endpoints REST a Binance)
 # ----------------------------------
 # ANTES: solo /depth y /futures/depth tenían cache. klines (pedido 4
@@ -728,8 +755,10 @@ def _generar_prediccion():
     """
     global _ULTIMO_ERROR_GENERACION
 
-    if _grupo_baneado("spot") or _grupo_baneado("futures"):
-        _ULTIMO_ERROR_GENERACION = "Ban activo (circuit breaker spot o futures) al momento del intento"
+    # Con funding/OI de Binance dados de baja, la tesis solo necesita el
+    # grupo SPOT (klines) -- un ban de futures ya no bloquea la generación.
+    if _grupo_baneado("spot") or (BINANCE_FUNDING_OI_ACTIVO and _grupo_baneado("futures")):
+        _ULTIMO_ERROR_GENERACION = "Ban activo (circuit breaker) al momento del intento"
         return None, None
 
     ahora = datetime.now(timezone.utc)
@@ -760,9 +789,10 @@ def _generar_prediccion():
     precio_actual = float(velas[-1][4])
 
     funding_valor = None
-    fbody, _ = _proxy_get_simple(f"{DOMINIO_FUTURES}/fapi/v1/premiumIndex", {"symbol": "BTCUSDT"}, grupo="futures")
-    if isinstance(fbody, dict) and "lastFundingRate" in fbody:
-        funding_valor = float(fbody["lastFundingRate"]) * 100
+    if BINANCE_FUNDING_OI_ACTIVO:  # dado de baja: la tesis se genera sin funding, cero requests a futures
+        fbody, _ = _proxy_get_simple(f"{DOMINIO_FUTURES}/fapi/v1/premiumIndex", {"symbol": "BTCUSDT"}, grupo="futures")
+        if isinstance(fbody, dict) and "lastFundingRate" in fbody:
+            funding_valor = float(fbody["lastFundingRate"]) * 100
 
     instrumentos = _obtener_instrumentos_deribit_interno()
     flip, gex_spot, call_wall, put_wall, regimen = None, None, None, None, None
@@ -1001,7 +1031,7 @@ def _generar_si_corresponde():
     si hay un ban activo -- ni siquiera intenta tomar el lock, cero
     trabajo de más mientras Binance ya está limitando la IP.
     """
-    if _grupo_baneado("spot") or _grupo_baneado("futures"):
+    if _grupo_baneado("spot") or (BINANCE_FUNDING_OI_ACTIVO and _grupo_baneado("futures")):
         return  # no sumar presión mientras el ban ya está activo
 
     with _PREDICCIONES_LOCK:
@@ -1155,6 +1185,10 @@ def depth():
 
 @app.route("/premiumIndex")
 def premium_index():
+    if not BINANCE_FUNDING_OI_ACTIVO:
+        body, status = _respuesta_dado_de_baja("Funding (premiumIndex)")
+        return jsonify(body), status
+
     if _grupo_baneado("futures"):
         body, status = _respuesta_ban_activo("futures")
         return jsonify(body), status
@@ -1172,6 +1206,10 @@ def premium_index():
 
 @app.route("/openInterest")
 def open_interest():
+    if not BINANCE_FUNDING_OI_ACTIVO:
+        body, status = _respuesta_dado_de_baja("Open Interest")
+        return jsonify(body), status
+
     if _grupo_baneado("futures"):
         body, status = _respuesta_ban_activo("futures")
         return jsonify(body), status

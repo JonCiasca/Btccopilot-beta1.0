@@ -61,6 +61,7 @@ def _respuesta_dado_de_baja(nombre):
 #     ráfagas.
 _CACHE = {}
 _CACHE_LOCK = threading.Lock()
+_CACHE_KEY_LOCKS = {}  # single-flight: un lock POR cache_key (ver docstring de abajo)
 
 TTL_RAPIDO = 4
 TTL_LENTO = 8
@@ -73,19 +74,45 @@ def _get_con_cache(cache_key, fetch_fn, ttl_segundos=TTL_RAPIDO):
     respuesta sin generar un pedido nuevo a Binance -- esto es lo que
     hace que N sesiones abiertas a la vez consuman el peso de Binance
     UNA sola vez por ventana, no N veces.
+
+    FIX SINGLE-FLIGHT (repasada anti-ban): la versión anterior tenía un
+    agujero justo cuando VENCE el TTL -- si 5 sesiones (o la misma
+    sesión reconectando varias veces, el caso real con señal
+    inestable) pedían lo mismo en el mismo instante con el cache
+    vencido, las 5 fallaban el chequeo del cache A LA VEZ y las 5
+    salían a Binance en paralelo con el pedido idéntico. Con el
+    auto-refresh de 15s sincronizando a todas las sesiones, esa
+    ráfaga se repetía en CADA vencimiento de TTL: peso x5 sin aportar
+    nada. Ahora hay un lock por cache_key: el primero que llega hace
+    el fetch, los demás ESPERAN ese mismo fetch y reusan el resultado
+    (re-chequean el cache al despertar). Un solo pedido a Binance por
+    ventana, siempre, sin importar cuántas sesiones/reconexiones haya.
     """
     ahora = time.time()
     with _CACHE_LOCK:
         entrada = _CACHE.get(cache_key)
         if entrada and (ahora - entrada[0]) < ttl_segundos:
             return entrada[1], entrada[2]
+        lock_key = _CACHE_KEY_LOCKS.setdefault(cache_key, threading.Lock())
 
-    body, status = fetch_fn()
+    with lock_key:
+        # Re-chequear: mientras esperábamos el lock, otro hilo pudo
+        # haber completado el MISMO fetch -- si es así, reusamos eso.
+        ahora = time.time()
+        with _CACHE_LOCK:
+            entrada = _CACHE.get(cache_key)
+            if entrada and (ahora - entrada[0]) < ttl_segundos:
+                return entrada[1], entrada[2]
 
-    with _CACHE_LOCK:
-        _CACHE[cache_key] = (ahora, body, status)
+        body, status = fetch_fn()
 
-    return body, status
+        with _CACHE_LOCK:
+            # time.time() DESPUÉS del fetch (antes se guardaba el
+            # timestamp de ANTES del fetch: con un fetch lento de 8s,
+            # la entrada nacía media vencida y acortaba el TTL real).
+            _CACHE[cache_key] = (time.time(), body, status)
+
+        return body, status
 
 
 # ----------------------------------
@@ -263,6 +290,11 @@ COOLDOWN_ON_DEMAND_SEGUNDOS = 600  # 10 min -- antes eran 120s (2 min), subido t
                                      # fallando) y varias sesiones reconectando cada 15s, 2 min de
                                      # cooldown seguía dejando hasta 30 intentos/hora justo en el peor
                                      # momento. 10 min baja eso a 6/hora como máximo.
+COOLDOWN_BOTON_MANUAL_SEGUNDOS = 120  # el botón "Generar análisis ahora" es admin-only y manual --
+                                       # no necesita el cooldown largo del disparo automático (que
+                                       # existe para frenar refreshes de 15s, no clicks conscientes).
+                                       # 2 min alcanza para absorber el doble-click accidental, y
+                                       # coincide con lo que el help del botón ya le dice al admin.
 RUTA_PREDICCIONES = "predicciones.json"
 
 _PREDICCIONES = []
@@ -946,7 +978,7 @@ def _guardar_predicciones_disco(lista):
         pass  # filesystem read-only u otro problema puntual -- no rompe el hilo
 
 
-def _ejecutar_ciclo_generacion(forzar=False, bloquear=True):
+def _ejecutar_ciclo_generacion(forzar=False, bloquear=True, cooldown_segundos=COOLDOWN_ON_DEMAND_SEGUNDOS):
     """
     Corre UN ciclo de generación (generar + sellar + guardar), protegido
     por _GENERACION_LOCK -- este lock es compartido entre el hilo de
@@ -962,28 +994,50 @@ def _ejecutar_ciclo_generacion(forzar=False, bloquear=True):
     inmediatamente -- así un request de un usuario no se cuelga
     esperando que termine un ciclo ajeno.
 
-    forzar=True: ignora el cooldown de 2 minutos (lo usa el hilo de
-    fondo, que ya decide su propio ritmo con time.sleep). forzar=False
-    respeta el cooldown -- evita que refreshes de 15s del dashboard
-    disparen un intento de generación cada vez que la anterior está
-    vencida pero la de ahora también falló.
+    forzar=True: ignora el cooldown (lo usa el hilo de fondo, que ya
+    decide su propio ritmo con time.sleep). forzar=False respeta el
+    cooldown -- evita que refreshes de 15s del dashboard disparen un
+    intento de generación cada vez que la anterior está vencida pero
+    la de ahora también falló.
 
-    Devuelve True si efectivamente generó y guardó una tesis nueva.
+    FIX CRÍTICO (el "no se emite nada y me dice que otro hilo ya lo
+    está haciendo"): la versión anterior actualizaba
+    _ULTIMO_INTENTO_GENERACION en TODOS los intentos, incluidos los
+    forzados del hilo de fondo. Como el reintento del hilo en fallo
+    (INTERVALO_REINTENTO_MINUTOS = 10 min) coincide EXACTO con el
+    cooldown on-demand (10 min), mientras el hilo siguiera fallando
+    (ban largo, Deribit caído, lo que sea) el timestamp se renovaba
+    cada 10 min y el disparo on-demand + el botón manual quedaban en
+    cooldown PERMANENTE: el admin apretaba el botón y veía siempre
+    "cooldown" o "ya hay una generación en curso", sin tesis nueva
+    jamás. Ahora el timestamp del cooldown SOLO lo mueven los intentos
+    on-demand/manuales (forzar=False) -- el hilo de fondo ya tiene su
+    propio ritmo con time.sleep y no necesita pisar el de los demás.
+
+    cooldown_segundos: el disparo automático usa el default largo
+    (600s); el botón manual pasa COOLDOWN_BOTON_MANUAL_SEGUNDOS (120s).
+
+    Devuelve (generado, motivo):
+      generado: True si efectivamente generó y guardó una tesis nueva.
+      motivo:   "ok" | "en_curso" | "cooldown" | "fallo" -- para que el
+                endpoint manual pueda decirle al admin QUÉ pasó de
+                verdad, en vez del mensaje ambiguo de antes.
     """
     global _PREDICCIONES, _ULTIMO_INTENTO_GENERACION, _ULTIMO_ERROR_GENERACION
 
     adquirido = _GENERACION_LOCK.acquire(blocking=bloquear)
     if not adquirido:
-        return False
+        return False, "en_curso"
 
     try:
-        if not forzar and (time.time() - _ULTIMO_INTENTO_GENERACION) < COOLDOWN_ON_DEMAND_SEGUNDOS:
-            return False
-        _ULTIMO_INTENTO_GENERACION = time.time()
+        if not forzar:
+            if (time.time() - _ULTIMO_INTENTO_GENERACION) < cooldown_segundos:
+                return False, "cooldown"
+            _ULTIMO_INTENTO_GENERACION = time.time()
 
         pred, velas_completas = _generar_prediccion()
         if not pred:
-            return False
+            return False, "fallo"
 
         ahora_ciclo = datetime.now(timezone.utc)
         with _PREDICCIONES_LOCK:
@@ -992,11 +1046,11 @@ def _ejecutar_ciclo_generacion(forzar=False, bloquear=True):
             _PREDICCIONES = _PREDICCIONES[:MAX_PREDICCIONES_GUARDADAS]
             _guardar_predicciones_disco(_PREDICCIONES)
         _ULTIMO_ERROR_GENERACION = None  # ciclo exitoso -- limpia cualquier error viejo
-        return True
+        return True, "ok"
     except Exception as e:
         _ULTIMO_ERROR_GENERACION = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
         print(f"[predicciones] error generando tesis: {_ULTIMO_ERROR_GENERACION}")
-        return False
+        return False, "fallo"
     finally:
         _GENERACION_LOCK.release()
 
@@ -1047,7 +1101,7 @@ def _generar_si_corresponde():
     if hay_predicciones and not vencida:
         return  # la más reciente sigue vigente, nada que generar todavía
 
-    _ejecutar_ciclo_generacion(forzar=False, bloquear=False)
+    _ejecutar_ciclo_generacion(forzar=False, bloquear=False)  # (generado, motivo) -- acá no importa el motivo
 
 
 def _hilo_generador_predicciones():
@@ -1072,7 +1126,7 @@ def _hilo_generador_predicciones():
         _PREDICCIONES = _cargar_predicciones_disco()
 
     while True:
-        generado = _ejecutar_ciclo_generacion(forzar=True, bloquear=True)
+        generado, _motivo = _ejecutar_ciclo_generacion(forzar=True, bloquear=True)
         if generado:
             time.sleep(INTERVALO_PREDICCION_HORAS * 3600)
         else:
@@ -1100,25 +1154,58 @@ def generar_prediccion_manual():
     Disparo MANUAL: pensado para un botón en el dashboard ("Generar
     análisis ahora"). A diferencia de _generar_si_corresponde (que solo
     actúa si la última tesis ya venció), esto intenta generar una nueva
-    SIEMPRE que se llame -- pero sigue respetando el cooldown de 2
-    minutos y el lock compartido con el hilo de fondo (forzar=False,
-    bloquear=False), así un click accidental doble, o varias sesiones
-    tocando el botón casi al mismo tiempo, no disparan pedidos
-    simultáneos a Binance/Deribit.
+    SIEMPRE que se llame -- pero sigue respetando un cooldown corto
+    propio (COOLDOWN_BOTON_MANUAL_SEGUNDOS, 2 min) y el lock compartido
+    con el hilo de fondo (forzar=False, bloquear=False), así un click
+    accidental doble, o varias sesiones tocando el botón casi al mismo
+    tiempo, no disparan pedidos simultáneos a Binance/Deribit.
+
+    MENSAJES (repasada): antes, cualquier fallo terminaba en un mensaje
+    ambiguo ("ya hay una generación en curso... o faltan datos") que no
+    decía QUÉ pasó -- y con el bug del cooldown permanente (ver
+    _ejecutar_ciclo_generacion) era lo único que se veía en pantalla.
+    Ahora cada motivo tiene su mensaje: ban activo (con segundos
+    restantes), cooldown real (con segundos restantes), generación
+    realmente en curso EN ESTE INSTANTE, o el error concreto del último
+    intento (_ULTIMO_ERROR_GENERACION) para diagnosticar sin abrir los
+    logs de Render.
     """
-    generado = _ejecutar_ciclo_generacion(forzar=False, bloquear=False)
+    # Ban activo: cortar acá con info útil, sin siquiera intentar --
+    # mismo criterio que _generar_si_corresponde.
+    for grupo in ("spot", "futures"):
+        if grupo == "futures" and not BINANCE_FUNDING_OI_ACTIVO:
+            continue
+        if _grupo_baneado(grupo):
+            restante = max(0, int(_BAN_HASTA[grupo] - time.time()))
+            return jsonify({
+                "ok": False,
+                "motivo": "ban",
+                "mensaje": (
+                    f"Binance tiene la IP limitada (grupo '{grupo}', -1003). Se libera sola en "
+                    f"~{restante}s. No se intenta generar mientras tanto para no extender el ban."
+                ),
+            }), 429
+
+    generado, motivo = _ejecutar_ciclo_generacion(
+        forzar=False, bloquear=False, cooldown_segundos=COOLDOWN_BOTON_MANUAL_SEGUNDOS
+    )
 
     if generado:
-        return jsonify({"ok": True, "mensaje": "Tesis nueva generada."})
+        return jsonify({"ok": True, "motivo": "ok", "mensaje": "Tesis nueva generada."})
 
-    segundos_cooldown_restantes = max(0, int(COOLDOWN_ON_DEMAND_SEGUNDOS - (time.time() - _ULTIMO_INTENTO_GENERACION)))
+    if motivo == "cooldown":
+        restante = max(0, int(COOLDOWN_BOTON_MANUAL_SEGUNDOS - (time.time() - _ULTIMO_INTENTO_GENERACION)))
+        mensaje = f"Cooldown del botón activo, esperá ~{restante}s e intentá de nuevo."
+    elif motivo == "en_curso":
+        mensaje = (
+            "Hay una generación corriendo EN ESTE instante (otra sesión o el ciclo "
+            "automático) -- suele tardar unos segundos, refrescá la solapa enseguida."
+        )
+    else:  # "fallo" -- el intento corrió pero no pudo emitir tesis
+        detalle = _ULTIMO_ERROR_GENERACION or "sin detalle registrado"
+        mensaje = f"El intento corrió pero falló: {detalle}"
 
-    if segundos_cooldown_restantes > 0:
-        mensaje = f"Cooldown activo, esperá ~{segundos_cooldown_restantes}s e intentá de nuevo."
-    else:
-        mensaje = "Ya hay una generación en curso (disparada por otra sesión o por el hilo de fondo) o faltan datos del mercado este ciclo -- probá de nuevo en unos segundos."
-
-    return jsonify({"ok": False, "mensaje": mensaje}), 429
+    return jsonify({"ok": False, "motivo": motivo, "mensaje": mensaje}), 429
 
 
 @app.route("/ticker24hr")

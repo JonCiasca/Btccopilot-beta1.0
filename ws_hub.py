@@ -45,6 +45,7 @@ que main.py (Streamlit) no necesita NINGÚN cambio.
 """
 
 import json
+import os
 import threading
 import time
 import traceback
@@ -118,7 +119,15 @@ for _iv in INTERVALOS:
     _estado["klines"][_iv] = deque(maxlen=MAX_VELAS)
     _estado["klines_seed_ok"][_iv] = False
 
-_arrancado = False
+# PID del proceso donde efectivamente arrancaron los hilos. Se guarda
+# el PID (y no un simple bool) por gunicorn con --preload / fork: el
+# master importa el módulo (hilos arrancan en el master), después
+# forkea los workers -- y LOS HILOS NO SOBREVIVEN AL FORK. El worker
+# hereda el estado congelado (todo en cero) y un bool diría "ya
+# arranqué" siendo mentira. Comparando el PID, cada worker detecta que
+# él mismo nunca arrancó los hilos y los levanta de nuevo (ver el
+# before_request en app.py).
+_pid_arranque = None
 
 
 # ----------------------------------
@@ -126,17 +135,26 @@ _arrancado = False
 # ----------------------------------
 
 def _get_rest(dominios, path, params, timeout=10):
-    """Prueba el mismo path en varios dominios y devuelve el primer JSON válido."""
+    """Prueba el mismo path en varios dominios y devuelve el primer JSON
+    con status 200. Si ninguno responde 200, devuelve el último body
+    JSON que se haya podido parsear (p. ej. el error -1003 de Binance,
+    que viene con status 418/429) -- así el caller puede detectar y
+    registrar un ban en vez de perder esa información."""
     ultimo_error = None
+    ultimo_body = None
     for base in dominios:
         try:
             r = requests.get(base + path, params=params, timeout=timeout)
             if r.status_code == 200:
                 return r.json(), None
+            try:
+                ultimo_body = r.json()
+            except ValueError:
+                pass
             ultimo_error = f"HTTP {r.status_code} en {base}"
         except Exception as e:
             ultimo_error = f"{base}: {e}"
-    return None, ultimo_error
+    return ultimo_body, ultimo_error
 
 
 def _seed_klines():
@@ -301,6 +319,8 @@ def _on_fut(d):
 
 _POLL_OI_BINANCE = True  # se define en iniciar() -- respeta el
                          # interruptor BINANCE_FUNDING_OI_ACTIVO de app.py
+_BAN_CHECK = None      # callable(grupo)->bool: el _grupo_baneado de app.py
+_BAN_REGISTRAR = None  # callable(grupo, body): el _registrar_si_es_ban de app.py
 
 
 def _loop_oi():
@@ -313,14 +333,20 @@ def _loop_oi():
     app.py), solo se pollea Bybit.
     """
     while True:
-        # Binance Futures OI (solo si el interruptor lo permite)
-        if _POLL_OI_BINANCE:
+        # Binance Futures OI (solo si el interruptor lo permite Y no hay
+        # un ban -1003 vigente -- respeta el circuit breaker de app.py:
+        # pegarle a Binance durante un ban lo puede EXTENDER).
+        if _POLL_OI_BINANCE and not (_BAN_CHECK and _BAN_CHECK("futures")):
             datos, err = _get_rest(FUT_REST, "/fapi/v1/openInterest",
                                    {"symbol": SYMBOL.upper()}, timeout=8)
             if isinstance(datos, dict) and "openInterest" in datos:
                 with _lock:
                     _estado["oi_binance"] = datos
                     _estado["oi_binance_ts"] = time.time()
+            elif isinstance(datos, dict) and _BAN_REGISTRAR:
+                # si Binance devolvió -1003, registrarlo en el circuit
+                # breaker de app.py para que TODO el proxy lo respete
+                _BAN_REGISTRAR("futures", datos)
         # Bybit OI
         datos, err = _get_rest(
             BYBIT_REST, "/v5/market/open-interest",
@@ -350,19 +376,28 @@ def _loop_oi():
 # API PÚBLICA (lo que usa app.py)
 # ----------------------------------
 
-def iniciar(poll_oi_binance=True):
-    """Arranca los hilos del hub. Llamar UNA vez al inicio del proceso.
-    Es idempotente: llamadas repetidas no crean hilos duplicados.
+def iniciar(poll_oi_binance=True, ban_check=None, ban_registrar=None):
+    """Arranca los hilos del hub. Idempotente POR PROCESO: llamadas
+    repetidas en el mismo proceso no duplican hilos, pero un proceso
+    forkeado (gunicorn --preload) detecta por PID que él no los tiene
+    y los arranca de nuevo. Por eso app.py la llama también desde un
+    before_request: el primer request de cada worker garantiza el hub
+    vivo en ESE worker.
 
     poll_oi_binance: pasarle BINANCE_FUNDING_OI_ACTIVO desde app.py.
     En False, el hub NO le pide Open Interest a Binance (el stream de
     funding por WS sigue igual: es push, no suma peso REST ni riesgo
-    de ban -1003)."""
-    global _arrancado, _POLL_OI_BINANCE
-    if _arrancado:
+    de ban -1003).
+    ban_check / ban_registrar: los hooks del circuit breaker de app.py
+    (_grupo_baneado / _registrar_si_es_ban) para que el poll de OI lo
+    respete y lo alimente."""
+    global _pid_arranque, _POLL_OI_BINANCE, _BAN_CHECK, _BAN_REGISTRAR
+    if _pid_arranque == os.getpid():
         return
-    _arrancado = True
+    _pid_arranque = os.getpid()
     _POLL_OI_BINANCE = bool(poll_oi_binance)
+    _BAN_CHECK = ban_check
+    _BAN_REGISTRAR = ban_registrar
 
     # Seed histórico en un hilo para no frenar el arranque del server
     threading.Thread(target=_seed_klines, daemon=True).start()

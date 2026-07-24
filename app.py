@@ -51,9 +51,11 @@ BINANCE_FUNDING_OI_ACTIVO = True
 # interruptor de arriba esté en False -- por eso /premiumIndex puede
 # servirlo desde cache sin riesgo. El OI de Binance sí necesita REST
 # (no hay stream público), así que su poll respeta el interruptor.
+# El arranque de los hilos está más abajo (_iniciar_ws_hub +
+# before_request), después del circuit breaker, porque el hub necesita
+# sus hooks y porque tiene que re-arrancarse por worker si gunicorn
+# forkea (--preload): los hilos NO sobreviven al fork.
 import ws_hub
-
-ws_hub.iniciar(poll_oi_binance=BINANCE_FUNDING_OI_ACTIVO)
 
 
 def _respuesta_dado_de_baja(nombre):
@@ -232,6 +234,44 @@ def _respuesta_ban_activo(grupo):
         "code": -1003,
         "ban_restante_segundos": restante,
     }, 429
+
+
+# ----------------------------------
+# ARRANQUE DEL HUB WS (a prueba de fork de gunicorn)
+# ----------------------------------
+# El episodio real que motivó esto: tras el deploy, /ws-status devolvía
+# TODO en cero/false con ultimo_error null y reconexiones 0 -- la firma
+# exacta de un worker forkeado: el master importó el módulo (hilos
+# arrancados en el master), gunicorn forkeó, y el worker heredó el
+# estado congelado SIN los hilos (los hilos no sobreviven al fork).
+# Solución: iniciar() es idempotente POR PID, y se llama también en
+# before_request -- el primer request que atiende cada worker levanta
+# los hilos en ESE worker. Costo por request después del primero: una
+# comparación de enteros.
+
+def _iniciar_ws_hub():
+    ws_hub.iniciar(
+        poll_oi_binance=BINANCE_FUNDING_OI_ACTIVO,
+        ban_check=_grupo_baneado,
+        ban_registrar=_registrar_si_es_ban,
+    )
+
+
+_iniciar_ws_hub()
+
+_RELAY_PID = None  # mismo criterio para el relay del bookmap (ver abajo)
+
+
+@app.before_request
+def _asegurar_hilos_vivos():
+    global _RELAY_PID
+    _iniciar_ws_hub()
+    # El relay de /ws/depth (bookmap) tenía el MISMO problema latente:
+    # sus hilos también arrancan al importar y también mueren en el
+    # fork. Se re-levantan acá por worker, igual que el hub.
+    if _RELAY_PID != os.getpid():
+        _RELAY_PID = os.getpid()
+        _iniciar_hilos_binance()
 
 
 # Dominios de Binance a probar en orden. Si Render bloquea uno
@@ -850,8 +890,12 @@ def _generar_prediccion():
     precio_actual = float(velas[-1][4])
 
     funding_valor = None
-    if BINANCE_FUNDING_OI_ACTIVO:  # dado de baja: la tesis se genera sin funding, cero requests a futures
-        fbody, _ = _proxy_get_simple(f"{DOMINIO_FUTURES}/fapi/v1/premiumIndex", {"symbol": "BTCUSDT"}, grupo="futures")
+    if BINANCE_FUNDING_OI_ACTIVO:
+        # Hub primero (stream push, funciona incluso con ban -1003
+        # vigente); REST solo como fallback y NUNCA durante un ban.
+        fbody = ws_hub.get_premium_index()
+        if fbody is None and not _grupo_baneado("futures"):
+            fbody, _ = _proxy_get_simple(f"{DOMINIO_FUTURES}/fapi/v1/premiumIndex", {"symbol": "BTCUSDT"}, grupo="futures")
         if isinstance(fbody, dict) and "lastFundingRate" in fbody:
             funding_valor = float(fbody["lastFundingRate"]) * 100
 
@@ -1114,7 +1158,12 @@ def _generar_si_corresponde():
     si hay un ban activo -- ni siquiera intenta tomar el lock, cero
     trabajo de más mientras Binance ya está limitando la IP.
     """
-    if _grupo_baneado("spot") or (BINANCE_FUNDING_OI_ACTIVO and _grupo_baneado("futures")):
+    # Con el hub WS vivo, un ban ya NO impide generar (las velas salen
+    # del stream) -- solo se corta acá si el hub está frío Y hay ban:
+    # en ese caso sí habría que ir por REST, y eso es lo que no se hace.
+    if ws_hub.get_klines("15m", 100) is None and (
+        _grupo_baneado("spot") or (BINANCE_FUNDING_OI_ACTIVO and _grupo_baneado("futures"))
+    ):
         return  # no sumar presión mientras el ban ya está activo
 
     with _PREDICCIONES_LOCK:
@@ -1200,9 +1249,16 @@ def generar_prediccion_manual():
     logs de Render.
     """
     # Ban activo: cortar acá con info útil, sin siquiera intentar --
-    # mismo criterio que _generar_si_corresponde.
+    # mismo criterio que _generar_si_corresponde. PERO: si el hub WS
+    # tiene el dato equivalente (velas para spot, funding para
+    # futures), el ban ya no bloquea nada -- la tesis se genera del
+    # stream sin tocar REST, así que se sigue de largo.
     for grupo in ("spot", "futures"):
         if grupo == "futures" and not BINANCE_FUNDING_OI_ACTIVO:
+            continue
+        if grupo == "spot" and ws_hub.get_klines("15m", 100) is not None:
+            continue
+        if grupo == "futures" and ws_hub.get_premium_index() is not None:
             continue
         if _grupo_baneado(grupo):
             restante = max(0, int(_BAN_HASTA[grupo] - time.time()))
@@ -1576,6 +1632,10 @@ def _iniciar_hilos_binance():
 
 
 _iniciar_hilos_binance()
+_RELAY_PID = os.getpid()  # este proceso ya tiene el relay vivo; si un
+                           # worker forkeado atiende un request, el
+                           # before_request detecta el PID distinto y
+                           # lo re-levanta ahí (ver _asegurar_hilos_vivos)
 
 
 @sock.route("/ws/depth")

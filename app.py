@@ -29,7 +29,13 @@ sock = Sock(app)
 #
 # Para reactivarlos: poner True acá y el mismo flag en main.py
 # (Streamlit) -- son dos repos distintos, hay que tocar los dos.
-BINANCE_FUNDING_OI_ACTIVO = False
+# REACTIVADO (antes False): con el hub WebSocket de abajo, el funding
+# llega por stream push (cero peso REST, cero riesgo -1003) y el OI se
+# pollea UNA vez cada 30s desde el hub -- 2 pedidos por minuto en
+# total, contra los ~8 por minuto POR SESIÓN que generaban los bans.
+# Si algún día vuelve un ban de futures, el circuit breaker de siempre
+# sigue actuando sobre el fallback REST; el stream no se ve afectado.
+BINANCE_FUNDING_OI_ACTIVO = True
 
 # ----------------------------------
 # HUB WEBSOCKET — datos de mercado en tiempo real, sin peso REST
@@ -1422,6 +1428,16 @@ def bybit_open_interest():
         return jsonify(r.json()), r.status_code
     except Exception as e:
         return jsonify({"error": str(e)}), 502
+
+
+@app.route("/oi/agregado")
+def oi_agregado():
+    """Open Interest combinado Binance + Bybit + OKX (normalizado a
+    BTC), servido 100% desde la cache del hub -- cero pedidos extra.
+    Más veraz que mirar un solo exchange: si uno se cae o banea, el
+    agregado sigue con las fuentes que queden (fuentes_activas dice
+    cuáles entraron en el total)."""
+    return jsonify(ws_hub.get_oi_agregado())
 
 
 @app.route("/ws-status")

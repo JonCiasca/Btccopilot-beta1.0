@@ -84,6 +84,7 @@ SPOT_REST = ["https://data-api.binance.vision", "https://api.binance.com",
              "https://api1.binance.com", "https://api2.binance.com"]
 FUT_REST = ["https://fapi.binance.com"]
 BYBIT_REST = ["https://api.bybit.com"]
+OKX_REST = ["https://www.okx.com"]
 
 # ----------------------------------
 # ESTADO (cache en memoria)
@@ -100,6 +101,8 @@ _estado = {
     "oi_binance_ts": 0,
     "oi_bybit": None,          # dict crudo de Bybit (retCode/result/list)
     "oi_bybit_ts": 0,
+    "oi_okx": None,            # dict crudo de OKX (code/data)
+    "oi_okx_ts": 0,
     "klines": {},              # interval -> deque de listas de 12 campos
     "klines_seed_ok": {},      # interval -> bool
     "ws_spot_ok": False,
@@ -329,6 +332,17 @@ def _loop_oi():
             with _lock:
                 _estado["oi_bybit"] = datos
                 _estado["oi_bybit_ts"] = time.time()
+        # OKX OI (perpetuo BTC-USDT-SWAP) -- gratis, sin API key, y OKX
+        # no bloquea la IP de Render. Tercera fuente para el agregado.
+        datos, err = _get_rest(
+            OKX_REST, "/api/v5/public/open-interest",
+            {"instType": "SWAP", "instId": "BTC-USDT-SWAP"},
+            timeout=8,
+        )
+        if isinstance(datos, dict) and datos.get("code") == "0":
+            with _lock:
+                _estado["oi_okx"] = datos
+                _estado["oi_okx_ts"] = time.time()
         time.sleep(POLL_OI_SEGUNDOS)
 
 
@@ -418,6 +432,49 @@ def get_bybit_open_interest(max_edad=120):
         if _estado["oi_bybit"] and _fresco(_estado["oi_bybit_ts"], max_edad):
             return dict(_estado["oi_bybit"])
     return None
+
+
+def get_okx_open_interest(max_edad=120):
+    """OI de OKX (respuesta cruda v5) desde cache. None si está fría."""
+    with _lock:
+        if _estado["oi_okx"] and _fresco(_estado["oi_okx_ts"], max_edad):
+            return dict(_estado["oi_okx"])
+    return None
+
+
+def get_oi_agregado():
+    """Open Interest combinado de las 3 fuentes, normalizado a BTC.
+
+    Devuelve dict con el detalle por exchange (None donde falte dato)
+    y el total de las fuentes disponibles. Pensado para el endpoint
+    /oi/agregado del proxy: una sola vista "veraz" del OI, sin
+    depender de un solo exchange ni de servicios pagos tipo Coinglass.
+    """
+    fuentes = {}
+
+    d = get_open_interest()
+    fuentes["binance"] = float(d["openInterest"]) if d and "openInterest" in d else None
+
+    d = get_bybit_open_interest()
+    try:
+        fuentes["bybit"] = float(d["result"]["list"][0]["openInterest"]) if d else None
+    except (KeyError, IndexError, TypeError, ValueError):
+        fuentes["bybit"] = None
+
+    d = get_okx_open_interest()
+    try:
+        # OKX: "oiCcy" ya viene expresado en moneda base (BTC)
+        fuentes["okx"] = float(d["data"][0]["oiCcy"]) if d else None
+    except (KeyError, IndexError, TypeError, ValueError):
+        fuentes["okx"] = None
+
+    disponibles = {k: v for k, v in fuentes.items() if v is not None}
+    return {
+        "unidad": "BTC",
+        "por_exchange": fuentes,
+        "total_btc": round(sum(disponibles.values()), 1) if disponibles else None,
+        "fuentes_activas": sorted(disponibles.keys()),
+    }
 
 
 def estado():

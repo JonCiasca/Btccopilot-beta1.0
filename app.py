@@ -31,6 +31,24 @@ sock = Sock(app)
 # (Streamlit) -- son dos repos distintos, hay que tocar los dos.
 BINANCE_FUNDING_OI_ACTIVO = False
 
+# ----------------------------------
+# HUB WEBSOCKET — datos de mercado en tiempo real, sin peso REST
+# ----------------------------------
+# ws_hub mantiene UNA conexión WS persistente con Binance (ticker 24h
+# + klines 1m/5m/15m/1h/4h/1d por spot, funding por futures) y una
+# cache en memoria siempre al día, tick a tick. Los endpoints de abajo
+# intentan PRIMERO esa cache (respuesta instantánea, cero peso REST,
+# cero riesgo -1003) y solo si está fría caen al camino REST de
+# siempre (cache TTL + circuit breaker). Mismo patrón push que el
+# relay de /ws/depth de más abajo, que ya venía andando.
+# El funding llega por stream (push): NO suma peso REST aunque el
+# interruptor de arriba esté en False -- por eso /premiumIndex puede
+# servirlo desde cache sin riesgo. El OI de Binance sí necesita REST
+# (no hay stream público), así que su poll respeta el interruptor.
+import ws_hub
+
+ws_hub.iniciar(poll_oi_binance=BINANCE_FUNDING_OI_ACTIVO)
+
 
 def _respuesta_dado_de_baja(nombre):
     return {
@@ -787,25 +805,30 @@ def _generar_prediccion():
     """
     global _ULTIMO_ERROR_GENERACION
 
-    # Con funding/OI de Binance dados de baja, la tesis solo necesita el
-    # grupo SPOT (klines) -- un ban de futures ya no bloquea la generación.
-    if _grupo_baneado("spot") or (BINANCE_FUNDING_OI_ACTIVO and _grupo_baneado("futures")):
-        _ULTIMO_ERROR_GENERACION = "Ban activo (circuit breaker) al momento del intento"
-        return None, None
-
     ahora = datetime.now(timezone.utc)
 
-    velas_completas, status = _proxy_get(
-        DOMINIOS_SPOT, "/api/v3/klines",
-        {"symbol": "BTCUSDT", "interval": "15m", "limit": 100}, grupo="spot",
-    )
-    if not isinstance(velas_completas, list) or len(velas_completas) < 30:
-        _ULTIMO_ERROR_GENERACION = (
-            f"Klines insuficientes o inválidas: status_http={status}, "
-            f"tipo_respuesta={type(velas_completas).__name__}, "
-            f"contenido={str(velas_completas)[:200]}"
+    # 1) Velas desde el hub WS: cero peso REST y, clave, FUNCIONA AUN
+    # CON BAN ACTIVO (el stream no pasa por el rate-limit REST) -- una
+    # tesis ya no se pierde por un -1003 vigente.
+    velas_completas = ws_hub.get_klines("15m", 100)
+
+    if not velas_completas:
+        # 2) Fallback REST, con el mismo circuit breaker de siempre.
+        if _grupo_baneado("spot") or (BINANCE_FUNDING_OI_ACTIVO and _grupo_baneado("futures")):
+            _ULTIMO_ERROR_GENERACION = "Ban activo (circuit breaker) al momento del intento"
+            return None, None
+
+        velas_completas, status = _proxy_get(
+            DOMINIOS_SPOT, "/api/v3/klines",
+            {"symbol": "BTCUSDT", "interval": "15m", "limit": 100}, grupo="spot",
         )
-        return None, None
+        if not isinstance(velas_completas, list) or len(velas_completas) < 30:
+            _ULTIMO_ERROR_GENERACION = (
+                f"Klines insuficientes o inválidas: status_http={status}, "
+                f"tipo_respuesta={type(velas_completas).__name__}, "
+                f"contenido={str(velas_completas)[:200]}"
+            )
+            return None, None
 
     velas = velas_completas  # ahora la ventana corta y la completa son la misma (100 velas, ~25hs)
 
@@ -1210,11 +1233,19 @@ def generar_prediccion_manual():
 
 @app.route("/ticker24hr")
 def ticker24hr():
+    symbol = request.args.get("symbol", "BTCUSDT")
+
+    # 1) Cache del hub WS (tick a tick, cero peso REST) -- camino normal.
+    if symbol.upper() == "BTCUSDT":
+        d = ws_hub.get_ticker24hr()
+        if d is not None:
+            return jsonify(d), 200
+
+    # 2) Fallback REST (hub frío: proceso recién despierto o stream caído).
     if _grupo_baneado("spot"):
         body, status = _respuesta_ban_activo("spot")
         return jsonify(body), status
 
-    symbol = request.args.get("symbol", "BTCUSDT")
     cache_key = f"ticker24hr:{symbol}"
 
     body, status = _get_con_cache(
@@ -1227,13 +1258,25 @@ def ticker24hr():
 
 @app.route("/klines")
 def klines():
+    symbol = request.args.get("symbol", "BTCUSDT")
+    interval = request.args.get("interval", "5m")
+    limit = request.args.get("limit", "100")
+
+    # 1) Cache del hub WS: velas al día tick a tick, cero peso REST.
+    if symbol.upper() == "BTCUSDT":
+        try:
+            limite_int = max(1, min(int(limit), 500))
+        except ValueError:
+            limite_int = 100
+        filas = ws_hub.get_klines(interval, limite_int)
+        if filas is not None:
+            return jsonify(filas), 200
+
+    # 2) Fallback REST (intervalo no streameado o hub todavía sin seed).
     if _grupo_baneado("spot"):
         body, status = _respuesta_ban_activo("spot")
         return jsonify(body), status
 
-    symbol = request.args.get("symbol", "BTCUSDT")
-    interval = request.args.get("interval", "5m")
-    limit = request.args.get("limit", "100")
     cache_key = f"klines:{symbol}:{interval}:{limit}"
 
     body, status = _get_con_cache(
@@ -1272,6 +1315,16 @@ def depth():
 
 @app.route("/premiumIndex")
 def premium_index():
+    # 1) Cache del hub WS: el funding llega por stream markPrice (push,
+    # cero peso REST, cero riesgo -1003) -- por eso se sirve INCLUSO con
+    # el interruptor en False. Para que el dashboard vuelva a mostrarlo
+    # alcanza con poner BINANCE_FUNDING_OI_ACTIVO = True en main.py
+    # (el flag de acá ya no afecta este dato: no cuesta nada servirlo).
+    if request.args.get("symbol", "BTCUSDT").upper() == "BTCUSDT":
+        d = ws_hub.get_premium_index()
+        if d is not None:
+            return jsonify(d), 200
+
     if not BINANCE_FUNDING_OI_ACTIVO:
         body, status = _respuesta_dado_de_baja("Funding (premiumIndex)")
         return jsonify(body), status
@@ -1293,6 +1346,13 @@ def premium_index():
 
 @app.route("/openInterest")
 def open_interest():
+    # Cache del hub WS (solo se llena si el interruptor está en True,
+    # porque el OI de Binance sí necesita poll REST -- ver ws_hub).
+    if request.args.get("symbol", "BTCUSDT").upper() == "BTCUSDT":
+        d = ws_hub.get_open_interest()
+        if d is not None:
+            return jsonify(d), 200
+
     if not BINANCE_FUNDING_OI_ACTIVO:
         body, status = _respuesta_dado_de_baja("Open Interest")
         return jsonify(body), status
@@ -1342,6 +1402,13 @@ def bybit_open_interest():
     # circuit breaker de Binance -- no lo pisamos con _BAN_HASTA.
     symbol = request.args.get("symbol", "BTCUSDT")
     interval_time = request.args.get("intervalTime", "5min")
+
+    # Cache del hub WS (poll propio cada 30s): absorbe los refreshes
+    # de todas las sesiones con UN solo pedido a Bybit por ventana.
+    if symbol.upper() == "BTCUSDT" and interval_time == "5min":
+        d = ws_hub.get_bybit_open_interest()
+        if d is not None:
+            return jsonify(d), 200
     try:
         r = requests.get(
             f"{DOMINIO_BYBIT}/v5/market/open-interest",
@@ -1357,6 +1424,14 @@ def bybit_open_interest():
         return jsonify({"error": str(e)}), 502
 
 
+@app.route("/ws-status")
+def ws_status():
+    """Diagnóstico del hub WS: streams conectados, edad de cada dato,
+    velas en cache, reconexiones y último error. Mirar esto tras cada
+    deploy para confirmar que el tiempo real está andando."""
+    return jsonify(ws_hub.estado())
+
+
 @app.route("/")
 def home():
     ahora = time.time()
@@ -1364,6 +1439,7 @@ def home():
         "status": "ok",
         "mensaje": "Proxy de Binance funcionando",
         "websocket": "/ws/depth?market=spot|futures",
+        "ws_hub": "/ws-status",
         "bookmap": "/bookmap",
         "predicciones": "/predicciones",
         "ban_spot_activo": _grupo_baneado("spot"),

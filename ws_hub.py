@@ -77,7 +77,13 @@ WATCHDOG_SEGUNDOS = 60   # si no llega ningún mensaje en este tiempo, reconecta
 SEED_LIMIT = 300         # velas históricas que se cargan al arrancar (REST, 1 vez)
 
 SPOT_WS = "wss://data-stream.binance.vision/stream"
-FUT_WS = "wss://fstream.binance.com/stream"
+# Futures en formato de stream CRUDO (/ws/<stream>), NO combinado
+# (/stream?streams=...): episodio real en Render -- el combinado
+# conectaba pero no entregaba ni un mensaje (watchdog timeout cada
+# 60s, funding siempre null), mientras que el relay del bookmap, que
+# usa /ws/ crudo contra el mismo host, funcionaba perfecto. Mismo
+# formato que el relay, entonces.
+FUT_WS_RAW = f"wss://fstream.binance.com/ws/{SYMBOL}@markPrice@1s"
 
 # Dominios REST para el seed inicial y el poll de OI (mismo criterio
 # que ya usa app.py: probar varios por si alguno bloquea la IP).
@@ -268,15 +274,15 @@ def _procesar_mark_price(d):
 # LOOPS DE CONEXIÓN (con reconexión automática)
 # ----------------------------------
 
-def _loop_ws(nombre, url, streams, on_data, clave_ok, clave_ts, clave_reconn):
+def _loop_ws(nombre, full_url, on_data, clave_ok, clave_ts, clave_reconn):
     """Loop genérico: conecta, escucha, y si algo se corta espera y
-    reconecta con backoff. Nunca lanza excepción hacia afuera."""
+    reconecta con backoff. Nunca lanza excepción hacia afuera.
+    full_url ya viene armada (combinada para spot, cruda para futures)."""
     backoff = 1
     while True:
         try:
-            full = url + "?streams=" + "/".join(streams)
             ws = websocket.create_connection(
-                full, timeout=WATCHDOG_SEGUNDOS, enable_multithread=True
+                full_url, timeout=WATCHDOG_SEGUNDOS, enable_multithread=True
             )
             with _lock:
                 _estado[clave_ok] = True
@@ -403,17 +409,17 @@ def iniciar(poll_oi_binance=True, ban_check=None, ban_registrar=None):
     threading.Thread(target=_seed_klines, daemon=True).start()
 
     streams_spot = [f"{SYMBOL}@ticker"] + [f"{SYMBOL}@kline_{iv}" for iv in INTERVALOS]
+    url_spot = SPOT_WS + "?streams=" + "/".join(streams_spot)
     threading.Thread(
         target=_loop_ws,
-        args=("ws_spot", SPOT_WS, streams_spot, _on_spot,
+        args=("ws_spot", url_spot, _on_spot,
               "ws_spot_ok", "ultimo_msg_spot", "reconexiones_spot"),
         daemon=True,
     ).start()
 
-    threams_fut = [f"{SYMBOL}@markPrice@1s"]
     threading.Thread(
         target=_loop_ws,
-        args=("ws_fut", FUT_WS, threams_fut, _on_fut,
+        args=("ws_fut", FUT_WS_RAW, _on_fut,
               "ws_fut_ok", "ultimo_msg_fut", "reconexiones_fut"),
         daemon=True,
     ).start()

@@ -219,7 +219,43 @@ def _registrar_si_es_ban(grupo, body):
     _guardar_ban_estado()  # persistir YA -- ver docstring de _guardar_ban_estado
 
 
+_BAN_ESTADO_MTIME = 0.0
+
+
+def _refrescar_ban_estado_desde_disco():
+    """
+    SINCRONIZACIÓN ENTRE WORKERS (episodio real): el ban vive en la
+    memoria de CADA worker de gunicorn, y solo se leía del disco al
+    arrancar el proceso. Resultado observado: el worker A registraba
+    el -1003 y pausaba sus pedidos... mientras el worker B, que no se
+    había enterado, seguía pegándole a fapi cada pocos segundos (el
+    depth de futuros del panel institucional, los polls del hub) y
+    Binance EXTENDÍA el ban una y otra vez -- así se llegó a un ban de
+    ~2hs partiendo de uno de ~15min. Ahora cada chequeo de ban mira el
+    mtime del archivo: si otro worker registró un ban nuevo, este
+    worker lo adopta al instante (costo: un stat() de archivo, y solo
+    recarga cuando el mtime cambió).
+    """
+    global _BAN_ESTADO_MTIME
+    try:
+        m = os.path.getmtime(RUTA_BAN_ESTADO)
+    except OSError:
+        return  # no existe el archivo todavía
+    if m != _BAN_ESTADO_MTIME:
+        _BAN_ESTADO_MTIME = m
+        try:
+            with open(RUTA_BAN_ESTADO, "r") as f:
+                data = json.load(f)
+            # max(): si ESTE worker tiene un ban más nuevo aún no
+            # escrito (carrera de milisegundos), no retroceder.
+            _BAN_HASTA["spot"] = max(_BAN_HASTA["spot"], data.get("spot", 0))
+            _BAN_HASTA["futures"] = max(_BAN_HASTA["futures"], data.get("futures", 0))
+        except Exception:
+            pass
+
+
 def _grupo_baneado(grupo):
+    _refrescar_ban_estado_desde_disco()
     return time.time() < _BAN_HASTA[grupo]
 
 
@@ -1170,11 +1206,11 @@ def _generar_si_corresponde():
     trabajo de más mientras Binance ya está limitando la IP.
     """
     # Con el hub WS vivo, un ban ya NO impide generar (las velas salen
-    # del stream) -- solo se corta acá si el hub está frío Y hay ban:
-    # en ese caso sí habría que ir por REST, y eso es lo que no se hace.
-    if ws_hub.get_klines("15m", 100) is None and (
-        _grupo_baneado("spot") or (BINANCE_FUNDING_OI_ACTIVO and _grupo_baneado("futures"))
-    ):
+    # del stream). El funding es OPCIONAL para la tesis (siempre lo
+    # fue: con el interruptor en False se generaba sin funding), así
+    # que un ban de futures NUNCA bloquea la generación -- solo se
+    # corta si faltan las VELAS (hub frío) y spot está baneado.
+    if ws_hub.get_klines("15m", 100) is None and _grupo_baneado("spot"):
         return  # no sumar presión mientras el ban ya está activo
 
     with _PREDICCIONES_LOCK:
@@ -1262,27 +1298,22 @@ def generar_prediccion_manual():
     logs de Render.
     """
     # Ban activo: cortar acá con info útil, sin siquiera intentar --
-    # mismo criterio que _generar_si_corresponde. PERO: si el hub WS
-    # tiene el dato equivalente (velas para spot, funding para
-    # futures), el ban ya no bloquea nada -- la tesis se genera del
-    # stream sin tocar REST, así que se sigue de largo.
-    for grupo in ("spot", "futures"):
-        if grupo == "futures" and not BINANCE_FUNDING_OI_ACTIVO:
-            continue
-        if grupo == "spot" and ws_hub.get_klines("15m", 100) is not None:
-            continue
-        if grupo == "futures" and ws_hub.get_premium_index() is not None:
-            continue
-        if _grupo_baneado(grupo):
-            restante = max(0, int(_BAN_HASTA[grupo] - time.time()))
-            return jsonify({
-                "ok": False,
-                "motivo": "ban",
-                "mensaje": (
-                    f"Binance tiene la IP limitada (grupo '{grupo}', -1003). Se libera sola en "
-                    f"~{restante}s. No se intenta generar mientras tanto para no extender el ban."
-                ),
-            }), 429
+    # mismo criterio que _generar_si_corresponde. La tesis solo
+    # NECESITA velas: si el hub las tiene, ningún ban bloquea (el
+    # stream no pasa por el rate-limit REST). El funding es opcional
+    # (con ban de futures la tesis sale sin funding, como salía
+    # siempre con el interruptor en False) -- por eso futures ya no se
+    # chequea acá.
+    if ws_hub.get_klines("15m", 100) is None and _grupo_baneado("spot"):
+        restante = max(0, int(_BAN_HASTA["spot"] - time.time()))
+        return jsonify({
+            "ok": False,
+            "motivo": "ban",
+            "mensaje": (
+                f"Binance tiene la IP limitada (grupo 'spot', -1003) y el hub WS todavía "
+                f"no tiene velas. Se libera sola en ~{restante}s."
+            ),
+        }), 429
 
     generado, motivo = _ejecutar_ciclo_generacion(
         forzar=False, bloquear=False, cooldown_segundos=COOLDOWN_BOTON_MANUAL_SEGUNDOS

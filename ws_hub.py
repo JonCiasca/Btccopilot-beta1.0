@@ -353,6 +353,23 @@ def _loop_oi():
                 # si Binance devolvió -1003, registrarlo en el circuit
                 # breaker de app.py para que TODO el proxy lo respete
                 _BAN_REGISTRAR("futures", datos)
+
+        # Funding por poll REST (respaldo del stream): episodio real en
+        # Render -- el WS de futures conectaba pero no entregaba ni un
+        # mensaje (en formato combinado Y crudo), con lo cual el
+        # funding quedaba en null para siempre. El poll lo cubre; si el
+        # stream algún día entrega, su dato (1 por segundo) es más
+        # fresco y este poll no lo pisa (chequeo de edad de 5s).
+        if _POLL_OI_BINANCE and not (_BAN_CHECK and _BAN_CHECK("futures")):
+            datos, err = _get_rest(FUT_REST, "/fapi/v1/premiumIndex",
+                                   {"symbol": SYMBOL.upper()}, timeout=8)
+            if isinstance(datos, dict) and "lastFundingRate" in datos:
+                with _lock:
+                    if time.time() - _estado["funding_ts"] > 5:
+                        _estado["funding"] = datos
+                        _estado["funding_ts"] = time.time()
+            elif isinstance(datos, dict) and _BAN_REGISTRAR:
+                _BAN_REGISTRAR("futures", datos)
         # Bybit OI
         datos, err = _get_rest(
             BYBIT_REST, "/v5/market/open-interest",

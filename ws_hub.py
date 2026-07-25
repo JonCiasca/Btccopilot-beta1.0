@@ -110,6 +110,8 @@ _estado = {
     "oi_bybit_ts": 0,
     "oi_okx": None,            # dict crudo de OKX (code/data)
     "oi_okx_ts": 0,
+    "funding_bybit": None,     # funding de Bybit (respaldo de Binance)
+    "funding_bybit_ts": 0,
     "klines": {},              # interval -> deque de listas de 12 campos
     "klines_seed_ok": {},      # interval -> bool
     "ws_spot_ok": False,
@@ -381,6 +383,26 @@ def _loop_oi():
             with _lock:
                 _estado["oi_bybit"] = datos
                 _estado["oi_bybit_ts"] = time.time()
+        # Funding de Bybit (perpetuo lineal) -- RESPALDO del funding de
+        # Binance: Bybit no banea la IP de Render, así que este dato
+        # está SIEMPRE, incluso con Binance en -1003. El funding de los
+        # perpetuos BTC trackea muy parecido entre exchanges, sirve
+        # perfectamente para leer el sesgo de posicionamiento.
+        datos, err = _get_rest(
+            BYBIT_REST, "/v5/market/tickers",
+            {"category": "linear", "symbol": SYMBOL.upper()},
+            timeout=8,
+        )
+        if isinstance(datos, dict) and datos.get("retCode") == 0:
+            try:
+                fila = datos["result"]["list"][0]
+                if fila.get("fundingRate") not in (None, ""):
+                    with _lock:
+                        _estado["funding_bybit"] = fila
+                        _estado["funding_bybit_ts"] = time.time()
+            except (KeyError, IndexError, TypeError):
+                pass
+
         # OKX OI (perpetuo BTC-USDT-SWAP) -- gratis, sin API key, y OKX
         # no bloquea la IP de Render. Tercera fuente para el agregado.
         datos, err = _get_rest(
@@ -477,21 +499,61 @@ def get_premium_index(max_edad=600):
     (valor anterior), un ban de 15 min dejaba el funding 'frío' y
     volteaba el endpoint y la generación de tesis sin necesidad: el
     último valor conocido de hace unos minutos sigue siendo
-    operativamente válido."""
+    operativamente válido.
+
+    MULTI-EXCHANGE: si el dato de Binance no está (ban largo, stream
+    mudo), se sirve el funding de BYBIT mapeado al mismo formato --
+    los perpetuos BTC trackean funding muy parecido entre exchanges,
+    y con esto el dashboard y las tesis nunca se quedan sin el dato.
+    El campo extra "fuente" dice de dónde salió."""
     with _lock:
         if _estado["funding"] and _fresco(_estado["funding_ts"], max_edad):
-            return dict(_estado["funding"])
+            d = dict(_estado["funding"])
+            d.setdefault("fuente", "binance")
+            return d
+        fb = _estado["funding_bybit"]
+        if fb and _fresco(_estado["funding_bybit_ts"], max_edad):
+            return {
+                "symbol": "BTCUSDT",
+                "markPrice": fb.get("markPrice", ""),
+                "indexPrice": fb.get("indexPrice", ""),
+                "lastFundingRate": fb["fundingRate"],
+                "nextFundingTime": int(fb.get("nextFundingTime") or 0),
+                "time": int(time.time() * 1000),
+                "fuente": "bybit",
+            }
     return None
 
 
 def get_open_interest(max_edad=300):
-    """OI de Binance Futures desde cache. None si está fría.
+    """OI desde cache. None si está fría.
     Tolerancia de 5 min: el poll se pausa durante bans (ver
     get_premium_index) y un OI de hace unos minutos sigue siendo
-    mejor que un panel caído."""
+    mejor que un panel caído.
+
+    MULTI-EXCHANGE: si el OI de Binance no está (ban largo), se sirve
+    el de BYBIT mapeado al mismo formato, con "fuente": "bybit".
+    OJO: los valores absolutos difieren entre exchanges (Binance ~85k
+    BTC, Bybit ~50k), así que al cambiar de fuente el 'Cambio OI' del
+    dashboard puede mostrar UN salto puntual -- pasa solo al entrar o
+    salir de un ban, y es preferible a mostrar N/D por horas."""
     with _lock:
         if _estado["oi_binance"] and _fresco(_estado["oi_binance_ts"], max_edad):
-            return dict(_estado["oi_binance"])
+            d = dict(_estado["oi_binance"])
+            d.setdefault("fuente", "binance")
+            return d
+        ob = _estado["oi_bybit"]
+        if ob and _fresco(_estado["oi_bybit_ts"], max_edad):
+            try:
+                valor = ob["result"]["list"][0]["openInterest"]
+                return {
+                    "symbol": "BTCUSDT",
+                    "openInterest": valor,
+                    "time": int(time.time() * 1000),
+                    "fuente": "bybit",
+                }
+            except (KeyError, IndexError, TypeError):
+                pass
     return None
 
 
@@ -570,6 +632,8 @@ def estado():
             if _estado["oi_bybit_ts"] else None,
             "oi_okx_edad_seg": round(time.time() - _estado["oi_okx_ts"], 1)
             if _estado["oi_okx_ts"] else None,
+            "funding_bybit_edad_seg": round(time.time() - _estado["funding_bybit_ts"], 1)
+            if _estado["funding_bybit_ts"] else None,
             "ban_futures_activo_para_polls": bool(_BAN_CHECK and _BAN_CHECK("futures")),
             "ultimo_error": _estado["ultimo_error"],
         }

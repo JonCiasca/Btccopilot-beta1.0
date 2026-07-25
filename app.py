@@ -1591,6 +1591,74 @@ def bybit_open_interest():
         return jsonify({"error": str(e)}), 502
 
 
+# ----------------------------------
+# MACRO & NOTICIAS (solapa 5 del dashboard)
+# ----------------------------------
+# El proxy centraliza las fuentes externas con cache generoso -- N
+# sesiones del dashboard generan UN pedido por ventana de cache, y
+# ninguna fuente ve la IP de los usuarios.
+
+FUENTES_RSS = [
+    ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/"),
+    ("Cointelegraph", "https://cointelegraph.com/rss"),
+    ("BBC World", "https://feeds.bbci.co.uk/news/world/rss.xml"),
+]
+
+URL_CALENDARIO_FF = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+
+
+@app.route("/calendario")
+def calendario():
+    """Calendario económico semanal (ForexFactory, gratuito). Cache 1h."""
+    def _fetch():
+        try:
+            r = requests.get(URL_CALENDARIO_FF, timeout=10,
+                             headers={"User-Agent": "btc-copilot/1.0"})
+            datos = r.json()
+            if isinstance(datos, list):
+                return {"eventos": datos}, 200
+            return {"eventos": [], "error": "formato inesperado"}, 502
+        except Exception as e:
+            return {"eventos": [], "error": str(e)}, 502
+
+    body, status = _get_con_cache("calendario_ff", _fetch, ttl_segundos=3600)
+    return jsonify(body), status
+
+
+@app.route("/noticias")
+def noticias():
+    """Titulares RSS (cripto + mundo). Cache 15 min."""
+    def _fetch():
+        import xml.etree.ElementTree as ET
+        items = []
+        for fuente, url in FUENTES_RSS:
+            try:
+                r = requests.get(url, timeout=10,
+                                 headers={"User-Agent": "btc-copilot/1.0"})
+                root = ET.fromstring(r.content)
+                por_fuente = 0
+                for it in root.iter("item"):
+                    titulo = it.findtext("title")
+                    link = it.findtext("link")
+                    fecha = it.findtext("pubDate") or ""
+                    if titulo and link:
+                        items.append({
+                            "titulo": titulo.strip(),
+                            "link": link.strip(),
+                            "fecha": fecha.strip(),
+                            "fuente": fuente,
+                        })
+                        por_fuente += 1
+                    if por_fuente >= 8:  # balancear fuentes
+                        break
+            except Exception:
+                continue  # una fuente caída no voltea a las demás
+        return {"noticias": items}, 200
+
+    body, status = _get_con_cache("noticias_rss", _fetch, ttl_segundos=900)
+    return jsonify(body), status
+
+
 @app.route("/oi/agregado")
 def oi_agregado():
     """Open Interest combinado Binance + Bybit + OKX (normalizado a

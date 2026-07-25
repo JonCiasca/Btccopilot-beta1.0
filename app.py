@@ -431,6 +431,32 @@ def _gamma_bs(spot, strike, vol_anual, dias, tasa=0.0):
     return _norm_pdf(d1) / (spot * vol_anual * math.sqrt(t))
 
 
+def _con_timeout_duro(fn, segundos, default=None):
+    """
+    Ejecuta fn() en un hilo aparte con tope de tiempo TOTAL. El
+    timeout= de requests solo corta si la conexión se queda muda --
+    si el servidor gotea bytes de a poco (episodio real con la
+    respuesta gigante de Deribit en la instancia free de Render), la
+    lectura puede seguir por minutos y el ciclo de generación queda
+    COLGADO reteniendo _GENERACION_LOCK: todos los intentos siguientes
+    devuelven 'en_curso' para siempre, sin error registrado. Con este
+    tope, a los N segundos se sigue sin ese dato (el hilo zombie se
+    descarta; es daemon, no bloquea nada).
+    """
+    resultado = {}
+
+    def _run():
+        try:
+            resultado["v"] = fn()
+        except Exception:
+            resultado["v"] = default
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(segundos)
+    return resultado.get("v", default)
+
+
 def _obtener_instrumentos_deribit_interno():
     """
     Mismo criterio que obtener_instrumentos_deribit en main.py, pero
@@ -946,7 +972,10 @@ def _generar_prediccion():
         if isinstance(fbody, dict) and "lastFundingRate" in fbody:
             funding_valor = float(fbody["lastFundingRate"]) * 100
 
-    instrumentos = _obtener_instrumentos_deribit_interno()
+    # Tope duro de 25s: si Deribit no entrega a tiempo, la tesis sale
+    # sin la pata de opciones (flip/walls/régimen) -- mejor una tesis
+    # de tendencia+niveles que un ciclo colgado que bloquea todo.
+    instrumentos = _con_timeout_duro(_obtener_instrumentos_deribit_interno, 25)
     flip, gex_spot, call_wall, put_wall, regimen = None, None, None, None, None
 
     if instrumentos:
@@ -1263,8 +1292,35 @@ _PRED_PID = os.getpid()  # este proceso ya tiene el hilo; los workers
                           # forkeados lo re-arman en before_request
 
 
+_PRED_DISCO_MTIME = 0.0
+
+
+def _recargar_predicciones_desde_disco():
+    """
+    Mismo problema (y misma solución) que el ban entre workers: cada
+    worker tiene SU lista de predicciones en memoria. El worker A
+    generaba y guardaba en disco, pero el worker B respondía
+    /predicciones con SU lista vacía -- el dashboard mostraba "no hay
+    predicciones" aunque la tesis existiera. Ahora, si el archivo en
+    disco cambió desde la última vez que este worker lo miró, se
+    recarga: el disco es la fuente de verdad compartida.
+    """
+    global _PRED_DISCO_MTIME, _PREDICCIONES
+    try:
+        m = os.path.getmtime(RUTA_PREDICCIONES)
+    except OSError:
+        return
+    if m != _PRED_DISCO_MTIME:
+        _PRED_DISCO_MTIME = m
+        lista = _cargar_predicciones_disco()
+        if lista:
+            with _PREDICCIONES_LOCK:
+                _PREDICCIONES = lista
+
+
 @app.route("/predicciones")
 def predicciones():
+    _recargar_predicciones_desde_disco()
     _generar_si_corresponde()
     with _PREDICCIONES_LOCK:
         lista = list(_PREDICCIONES)
@@ -1272,6 +1328,11 @@ def predicciones():
         "predicciones": lista,
         "intervalo_horas": INTERVALO_PREDICCION_HORAS,
         "ultimo_error_generacion": _ULTIMO_ERROR_GENERACION,
+        # Diagnóstico (main.py ignora las claves extra): para ver de
+        # afuera si un ciclo quedó colgado reteniendo el lock y qué
+        # worker respondió.
+        "generacion_en_curso": _GENERACION_LOCK.locked(),
+        "worker_pid": os.getpid(),
     })
 
 

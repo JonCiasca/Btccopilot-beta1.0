@@ -260,11 +260,15 @@ def _iniciar_ws_hub():
 _iniciar_ws_hub()
 
 _RELAY_PID = None  # mismo criterio para el relay del bookmap (ver abajo)
+_PRED_PID = None   # ...y para el hilo generador de predicciones: el
+                   # episodio real fue /predicciones devolviendo lista
+                   # vacía con ultimo_error null tras el deploy -- el
+                   # hilo de tesis también había muerto en el fork.
 
 
 @app.before_request
 def _asegurar_hilos_vivos():
-    global _RELAY_PID
+    global _RELAY_PID, _PRED_PID
     _iniciar_ws_hub()
     # El relay de /ws/depth (bookmap) tenía el MISMO problema latente:
     # sus hilos también arrancan al importar y también mueren en el
@@ -272,6 +276,13 @@ def _asegurar_hilos_vivos():
     if _RELAY_PID != os.getpid():
         _RELAY_PID = os.getpid()
         _iniciar_hilos_binance()
+    # Hilo generador de tesis: re-armarlo por worker también. Al
+    # arrancar, _hilo_generador_predicciones primero CARGA el historial
+    # desde disco (predicciones.json) -- eso además sincroniza la
+    # memoria del worker con lo último generado por cualquier otro.
+    if _PRED_PID != os.getpid():
+        _PRED_PID = os.getpid()
+        threading.Thread(target=_hilo_generador_predicciones, daemon=True).start()
 
 
 # Dominios de Binance a probar en orden. Si Render bloquea uno
@@ -1212,6 +1223,8 @@ def _hilo_generador_predicciones():
 
 
 threading.Thread(target=_hilo_generador_predicciones, daemon=True).start()
+_PRED_PID = os.getpid()  # este proceso ya tiene el hilo; los workers
+                          # forkeados lo re-arman en before_request
 
 
 @app.route("/predicciones")

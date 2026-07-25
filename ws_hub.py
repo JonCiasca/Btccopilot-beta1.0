@@ -468,23 +468,34 @@ def get_klines(intervalo, limite=100):
         return [list(f) for f in list(dq)[-limite:]]
 
 
-def get_premium_index(max_edad=60):
-    """Funding rate (premiumIndex) desde cache. None si está fría."""
+def get_premium_index(max_edad=600):
+    """Funding rate (premiumIndex) desde cache. None si está fría.
+
+    max_edad=600 (10 min) a propósito: el funding se recalcula lento y
+    casi no cambia minuto a minuto -- y el poll que lo alimenta se
+    PAUSA durante un ban -1003 (circuit breaker). Con 60s de tolerancia
+    (valor anterior), un ban de 15 min dejaba el funding 'frío' y
+    volteaba el endpoint y la generación de tesis sin necesidad: el
+    último valor conocido de hace unos minutos sigue siendo
+    operativamente válido."""
     with _lock:
         if _estado["funding"] and _fresco(_estado["funding_ts"], max_edad):
             return dict(_estado["funding"])
     return None
 
 
-def get_open_interest(max_edad=120):
-    """OI de Binance Futures desde cache. None si está fría."""
+def get_open_interest(max_edad=300):
+    """OI de Binance Futures desde cache. None si está fría.
+    Tolerancia de 5 min: el poll se pausa durante bans (ver
+    get_premium_index) y un OI de hace unos minutos sigue siendo
+    mejor que un panel caído."""
     with _lock:
         if _estado["oi_binance"] and _fresco(_estado["oi_binance_ts"], max_edad):
             return dict(_estado["oi_binance"])
     return None
 
 
-def get_bybit_open_interest(max_edad=120):
+def get_bybit_open_interest(max_edad=300):
     """OI de Bybit (respuesta cruda v5) desde cache. None si está fría."""
     with _lock:
         if _estado["oi_bybit"] and _fresco(_estado["oi_bybit_ts"], max_edad):
@@ -492,7 +503,7 @@ def get_bybit_open_interest(max_edad=120):
     return None
 
 
-def get_okx_open_interest(max_edad=120):
+def get_okx_open_interest(max_edad=300):
     """OI de OKX (respuesta cruda v5) desde cache. None si está fría."""
     with _lock:
         if _estado["oi_okx"] and _fresco(_estado["oi_okx_ts"], max_edad):
@@ -553,5 +564,12 @@ def estado():
             if _estado["ticker_ts"] else None,
             "funding_edad_seg": round(time.time() - _estado["funding_ts"], 1)
             if _estado["funding_ts"] else None,
+            "oi_binance_edad_seg": round(time.time() - _estado["oi_binance_ts"], 1)
+            if _estado["oi_binance_ts"] else None,
+            "oi_bybit_edad_seg": round(time.time() - _estado["oi_bybit_ts"], 1)
+            if _estado["oi_bybit_ts"] else None,
+            "oi_okx_edad_seg": round(time.time() - _estado["oi_okx_ts"], 1)
+            if _estado["oi_okx_ts"] else None,
+            "ban_futures_activo_para_polls": bool(_BAN_CHECK and _BAN_CHECK("futures")),
             "ultimo_error": _estado["ultimo_error"],
         }

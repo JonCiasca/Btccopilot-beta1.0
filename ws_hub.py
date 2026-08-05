@@ -69,7 +69,17 @@ SYMBOL = "btcusdt"
 
 # Intervalos de velas que usa el dashboard (main.py). Si algún día se
 # agrega una temporalidad nueva en el frontend, sumarla acá.
-INTERVALOS = ["1m", "5m", "15m", "1h", "4h", "1d"]
+#
+# FIX: faltaba "3m" -- se agregó en main.py para "Confluencia by
+# JonFlowMDQ" (Setup 1: MTF 3m/5m/15m) pero nunca se sumó acá. Como
+# "3m" no estaba en esta lista, el hub nunca lo seedeaba ni lo
+# streameaba: get_klines("3m", ...) devolvía None SIEMPRE, y el
+# endpoint /klines caía al fallback REST en TODOS los refreshes (cada
+# 8-10s, indefinidamente) para ese timeframe puntual -- ese REST sin
+# cache es lo que dispara los bans -1003 de peso, incluso con el
+# dashboard casi sin uso, mientras la sesión (o una pestaña vieja
+# olvidada) siga con el autorefresh corriendo de fondo.
+INTERVALOS = ["1m", "3m", "5m", "15m", "1h", "4h", "1d"]
 
 MAX_VELAS = 500          # velas guardadas por intervalo (el front pide <= 100)
 POLL_OI_SEGUNDOS = 30    # poll suave de Open Interest (REST, cacheado)
